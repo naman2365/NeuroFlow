@@ -221,10 +221,17 @@ class StudyLogsNotifier extends StateNotifier<List<StudyBlockLog>> {
   }
 
   Future<List<FeedbackItem>> fetchFeedbackInbox(String creatorPin) async {
-    final uri = Uri.parse(
-      '$kDefaultCloudflareWorkerUrl/feedback?pin=${Uri.encodeComponent(creatorPin.trim())}',
-    );
-    final resp = await http.get(uri).timeout(const Duration(seconds: 8));
+    final uri = Uri.parse('$kDefaultCloudflareWorkerUrl/feedback');
+    final resp = await http
+        .post(
+          uri,
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ${creatorPin.trim()}',
+          },
+          body: jsonEncode({}),
+        )
+        .timeout(const Duration(seconds: 8));
     if (resp.statusCode != 200) {
       throw Exception('Invalid PIN');
     }
