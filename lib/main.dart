@@ -1,5 +1,6 @@
-import 'dart:async';
-import 'dart:io' show Platform;
+﻿import 'dart:async';
+import 'dart:convert';
+import 'dart:io' show Platform, Process, ProcessSignal;
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -7,7 +8,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'package:window_manager/window_manager.dart';
+import 'package:window_manager/legacy.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:file_selector/file_selector.dart';
 import 'models.dart';
@@ -16,30 +17,37 @@ import 'providers.dart';
 bool get isDesktopPlatform =>
     !kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS);
 
-void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  await Hive.initFlutter();
-  await Hive.openBox('study_logs_box');
-  await Hive.openBox('settings_box');
+bool get isWindowsNative => !kIsWeb && Platform.isWindows;
 
-  if (isDesktopPlatform) {
-    await windowManager.ensureInitialized();
-    const windowOptions = WindowOptions(
-      size: Size(1180, 840),
-      minimumSize: Size(320, 180),
-      center: true,
-      backgroundColor: Colors.transparent,
-      skipTaskbar: false,
-      titleBarStyle: TitleBarStyle.hidden,
-      title: 'NeuroFlow — Cognitive Interleaver',
-    );
-    windowManager.waitUntilReadyToShow(windowOptions, () async {
-      await windowManager.show();
-      await windowManager.focus();
-    });
-  }
+void main() {
+  runZonedGuarded(() async {
+    WidgetsFlutterBinding.ensureInitialized();
+    await Hive.initFlutter();
+    await Hive.openBox('study_logs_box');
+    await Hive.openBox('settings_box');
 
-  runApp(const ProviderScope(child: FocusTrackerApp()));
+    if (isDesktopPlatform) {
+      // ignore: deprecated_member_use
+      await windowManager.ensureInitialized();
+      const windowOptions = WindowOptions(
+        size: Size(1180, 840),
+        minimumSize: Size(320, 180),
+        center: true,
+        backgroundColor: Color(0xFF14181B),
+        skipTaskbar: false,
+        titleBarStyle: TitleBarStyle.hidden,
+        title: 'NeuroFlow — Cognitive Interleaver',
+      );
+      await windowManager.waitUntilReadyToShow(windowOptions, () async {
+        await windowManager.show();
+        await windowManager.focus();
+      });
+    }
+
+    runApp(const ProviderScope(child: FocusTrackerApp()));
+  }, (error, stackTrace) {
+    debugPrint('Caught error: $error');
+  });
 }
 
 class FocusTrackerApp extends StatelessWidget {
@@ -65,10 +73,10 @@ class DashboardScreen extends ConsumerStatefulWidget {
   const DashboardScreen({super.key});
 
   @override
-  ConsumerState<DashboardScreen> createState() => _DashboardScreenState();
+  ConsumerState createState() => _DashboardScreenState();
 }
 
-class _DashboardScreenState extends ConsumerState<DashboardScreen> {
+class _DashboardScreenState extends ConsumerState {
   String _selectedSubject = 'Physics';
   Timer? _timer;
   int _secondsRemaining = 75 * 60;
@@ -81,30 +89,170 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
   final TextEditingController _doubtCtrl = TextEditingController();
   final ScrollController _chatScrollCtrl = ScrollController();
 
-  final AudioPlayer _audioPlayer = AudioPlayer();
+  // For Web & Android only (Never initialized on Windows so flutter_windows.dll never crashes!)
+  AudioPlayer? _mobileWebPlayer;
+
+  // For Windows: Isolated OS Background Process (Zero C++ DLL threads inside Flutter!)
+  Process? _winAudioProcess;
+  StreamSubscription? _winStdoutSub;
+
   bool _isMusicPlaying = false;
   bool _isMusicLoading = false;
+  bool _isLoopOne = false;
+  bool _isSeeking = false;
   double _volume = 0.6;
   String _selectedStation = 'Lofi Focus Beats';
-  String? _localFilePath;
-  String? _localFileName;
 
-  final Map<String, String> _directStations = {
-    'Lofi Focus Beats': 'https://streams.ilovemusic.de/iloveradio17.mp3',
-    'Deep Ambient Drone': 'https://ice2.somafm.com/dronezone-128-mp3',
-    'Synthwave Coding': 'https://ice2.somafm.com/spacestation-128-mp3',
-    'Classical Study': 'https://live.musopen.org:8085/streamvbr0',
-    'Local Audio File': 'local',
+  var _localPlaylist = [];
+  int _currentLocalIndex = 0;
+  Duration _audioDuration = Duration.zero;
+  Duration _audioPosition = Duration.zero;
+
+  final _directStations = {
+    'Lofi Focus Beats': 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3',
+    'Chillhop Study Groove': 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3',
+    'Synthwave Coding': 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-3.mp3',
+    'Deep Ambient Flow': 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-4.mp3',
+    'Cyberpunk Matrix': 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-8.mp3',
+    'Acoustic Guitar Study': 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-6.mp3',
+    'Classical Piano Focus': 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-9.mp3',
+    'Deep Space Horizon': 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-10.mp3',
+    '24/7 Live Lofi Radio': 'https://streams.ilovemusic.de/iloveradio17.mp3',
+    'Local Audio Playlist': 'local',
   };
 
   @override
   void initState() {
     super.initState();
-    _audioPlayer.setReleaseMode(ReleaseMode.loop);
-
     final settingsBox = Hive.box('settings_box');
-    _localFilePath = settingsBox.get('local_audio_path') as String?;
-    _localFileName = settingsBox.get('local_audio_name') as String?;
+    final savedQueue = settingsBox.get('local_audio_queue');
+    if (savedQueue is Iterable) {
+      for (final item in savedQueue) {
+        if (item is Map) {
+          final path = item['path']?.toString() ?? '';
+          final name = item['name']?.toString() ?? 'Track';
+          if (path.isNotEmpty) {
+            _localPlaylist.add({'path': path, 'name': name});
+          }
+        }
+      }
+    }
+  }
+
+  /// Launches a single hidden Windows PresentationCore audio process that communicates via stdin/stdout.
+  /// Because it runs outside focus_fatigue_tracker.exe, it can NEVER crash flutter_windows.dll!
+  Future _ensureWindowsAudioBridge() async {
+    if (_winAudioProcess != null) return;
+
+    const psScript = r'''
+Add-Type -AssemblyName PresentationCore
+$player = New-Object System.Windows.Media.MediaPlayer
+while ($true) {
+  $line = [Console]::In.ReadLine()
+  if ($null -eq $line) { break }
+  $parts = $line.Split('|', 2)
+  $cmd = $parts[0]
+  $arg = if ($parts.Length -gt 1) { $parts[1] } else { "" }
+  try {
+    if ($cmd -eq "OPEN") {
+      $player.Open([Uri]$arg)
+      $player.Play()
+      Write-Output "STATE|PLAYING"
+    } elseif ($cmd -eq "PAUSE") {
+      $player.Pause()
+      Write-Output "STATE|PAUSED"
+    } elseif ($cmd -eq "RESUME") {
+      $player.Play()
+      Write-Output "STATE|PLAYING"
+    } elseif ($cmd -eq "STOP") {
+      $player.Stop()
+      Write-Output "STATE|STOPPED"
+    } elseif ($cmd -eq "VOL") {
+      $player.Volume = [double]$arg
+    } elseif ($cmd -eq "SEEK") {
+      $player.Position = [TimeSpan]::FromSeconds([int]$arg)
+    } elseif ($cmd -eq "POLL") {
+      $pos = [int]$player.Position.TotalSeconds
+      $dur = if ($player.NaturalDuration.HasTimeSpan) { [int]$player.NaturalDuration.TimeSpan.TotalSeconds } else { 0 }
+      Write-Output "TIME|$pos|$dur"
+    }
+  } catch {}
+}
+''';
+
+    final proc = await Process.start(
+      'powershell',
+      ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', psScript],
+    );
+    _winAudioProcess = proc;
+
+    _winStdoutSub = proc.stdout.transform(utf8.decoder).transform(const LineSplitter()).listen((line) {
+      if (!mounted) return;
+      if (line.startsWith('TIME|')) {
+        final parts = line.split('|');
+        if (parts.length >= 3) {
+          final pos = int.tryParse(parts[1]) ?? 0;
+          final dur = int.tryParse(parts[2]) ?? 0;
+          if (!_isSeeking) {
+            setState(() {
+              _audioPosition = Duration(seconds: pos);
+              if (dur >= 1) _audioDuration = Duration(seconds: dur);
+            });
+          }
+          if (dur >= 5 && pos >= dur - 1 && !_isLiveRadioStream) {
+            if (_isLoopOne) {
+              _playCurrentSelection();
+            } else {
+              _skipTrack(1);
+            }
+          }
+        }
+      }
+    });
+
+    Timer.periodic(const Duration(seconds: 1), (t) {
+      if (!mounted || _winAudioProcess == null) {
+        t.cancel();
+        return;
+      }
+      if (_isMusicPlaying && !_isSeeking) {
+        try {
+          _winAudioProcess!.stdin.writeln('POLL|');
+        } catch (_) {}
+      }
+    });
+  }
+
+  AudioPlayer _ensureWebOrAndroidPlayer() {
+    if (_mobileWebPlayer != null) return _mobileWebPlayer!;
+    final p = AudioPlayer();
+    p.onDurationChanged.listen((d) {
+      if (mounted && d.inSeconds >= 1) setState(() => _audioDuration = d);
+    });
+    p.onPositionChanged.listen((pos) {
+      if (mounted && !_isSeeking && pos.inSeconds != _audioPosition.inSeconds) {
+        setState(() => _audioPosition = pos);
+      }
+    });
+    p.onPlayerComplete.listen((_) {
+      if (!mounted) return;
+      if (_isLoopOne) {
+        _playCurrentSelection();
+      } else {
+        _skipTrack(1);
+      }
+    });
+    _mobileWebPlayer = p;
+    return p;
+  }
+
+  bool get _isLiveRadioStream => _selectedStation == '24/7 Live Lofi Radio';
+
+  String _formatAudioDuration(Duration d) {
+    if (d.inSeconds <= 0 || d.inHours >= 24) return '00:00';
+    final mins = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final secs = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return '$mins:$secs';
   }
 
   void _scrollToLatestChat() {
@@ -119,15 +267,11 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     });
   }
 
-  Future<void> _sendDoubtOrRequest([String? presetPrompt]) async {
+  Future _sendDoubtOrRequest([String? presetPrompt]) async {
     final textToSend = presetPrompt ?? _doubtCtrl.text;
     if (textToSend.trim().isEmpty) return;
-
-    if (presetPrompt == null) {
-      _doubtCtrl.clear();
-    }
+    if (presetPrompt == null) _doubtCtrl.clear();
     _scrollToLatestChat();
-
     await ref.read(aiCoachProvider.notifier).askAssistant(
           userMessage: textToSend,
           currentSubject: _selectedSubject,
@@ -135,125 +279,182 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     _scrollToLatestChat();
   }
 
-  Future<void> _pickLocalAudioFile() async {
-    const XTypeGroup audioTypeGroup = XTypeGroup(
+  Future _pickLocalAudioFile() async {
+    if (kIsWeb) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Local file queue is supported on Windows & Android builds.')),
+      );
+      return;
+    }
+    const audioGroup = XTypeGroup(
       label: 'Audio Files',
-      extensions: <String>['mp3', 'wav', 'm4a', 'flac', 'ogg', 'aac'],
+      extensions: ['mp3', 'wav', 'm4a', 'flac', 'ogg', 'aac'],
     );
-
-    final XFile? file = await openFile(
-      acceptedTypeGroups: <XTypeGroup>[audioTypeGroup],
-    );
-
-    if (file != null) {
-      final String path = file.path;
-      final String name = file.name;
-
-      final settingsBox = Hive.box('settings_box');
-      await settingsBox.put('local_audio_path', path);
-      await settingsBox.put('local_audio_name', name);
-
+    final files = await openFiles(acceptedTypeGroups: [audioGroup]);
+    if (files.isNotEmpty) {
+      final newTracks = files.map((f) => {'path': f.path, 'name': f.name}).toList();
+      await Hive.box('settings_box').put('local_audio_queue', newTracks);
       setState(() {
-        _localFilePath = path;
-        _localFileName = name;
-        _selectedStation = 'Local Audio File';
-        _isMusicLoading = true;
+        _localPlaylist = List.from(newTracks);
+        _currentLocalIndex = 0;
+        _selectedStation = 'Local Audio Playlist';
       });
+      await _playCurrentSelection();
+    }
+  }
 
-      try {
-        await _audioPlayer.stop();
-        await _audioPlayer.setVolume(_volume);
-        await _audioPlayer.play(DeviceFileSource(path));
+  Future _playCurrentSelection() async {
+    setState(() {
+      _isMusicLoading = true;
+      _audioPosition = Duration.zero;
+      _audioDuration = Duration.zero;
+    });
+
+    try {
+      String targetUri = '';
+      bool isLocal = false;
+
+      if (_selectedStation == 'Local Audio Playlist') {
+        if (_localPlaylist.isEmpty) {
+          setState(() => _isMusicLoading = false);
+          await _pickLocalAudioFile();
+          return;
+        }
+        final currentTrack = _localPlaylist[_currentLocalIndex];
+        targetUri = currentTrack['path'].toString();
+        isLocal = true;
+      } else {
+        targetUri = _directStations[_selectedStation]!;
+      }
+
+      if (isWindowsNative) {
+        await _ensureWindowsAudioBridge();
+        final formattedUri = isLocal ? Uri.file(targetUri).toString() : targetUri;
+        _winAudioProcess!.stdin.writeln('VOL|$_volume');
+        _winAudioProcess!.stdin.writeln('OPEN|$formattedUri');
+      } else {
+        final player = _ensureWebOrAndroidPlayer();
+        await player.setVolume(_volume);
+        if (isLocal) {
+          await player.play(DeviceFileSource(targetUri));
+        } else {
+          await player.play(UrlSource(targetUri));
+        }
+      }
+
+      if (mounted) {
         setState(() {
           _isMusicPlaying = true;
           _isMusicLoading = false;
         });
-      } catch (e) {
-        setState(() => _isMusicLoading = false);
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Could not play local file: $e')),
-          );
-        }
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isMusicPlaying = false;
+          _isMusicLoading = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Audio error: $e')),
+        );
       }
     }
   }
 
-  Future<void> _toggleDirectMusic() async {
-    if (_isMusicPlaying) {
-      await _audioPlayer.pause();
-      setState(() => _isMusicPlaying = false);
-    } else {
-      if (_selectedStation == 'Local Audio File') {
-        if (_localFilePath == null) {
-          await _pickLocalAudioFile();
-          return;
-        }
-        setState(() => _isMusicLoading = true);
-        try {
-          await _audioPlayer.setVolume(_volume);
-          await _audioPlayer.play(DeviceFileSource(_localFilePath!));
-          setState(() {
-            _isMusicPlaying = true;
-            _isMusicLoading = false;
-          });
-        } catch (e) {
-          setState(() => _isMusicLoading = false);
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('Local file error: $e')),
-            );
-          }
-        }
-      } else {
-        setState(() => _isMusicLoading = true);
-        try {
-          final streamUrl = _directStations[_selectedStation]!;
-          await _audioPlayer.setVolume(_volume);
-          await _audioPlayer.play(UrlSource(streamUrl));
-          setState(() {
-            _isMusicPlaying = true;
-            _isMusicLoading = false;
-          });
-        } catch (e) {
-          setState(() => _isMusicLoading = false);
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('Stream error: $e')),
-            );
-          }
-        }
-      }
-    }
-  }
-
-  Future<void> _changeStation(String? newStation) async {
-    if (newStation == null) return;
-    setState(() => _selectedStation = newStation);
-
-    if (newStation == 'Local Audio File') {
-      if (_localFilePath == null) {
-        await _pickLocalAudioFile();
-        return;
-      }
+  Future _toggleDirectMusic() async {
+    if (_isMusicLoading) return;
+    try {
       if (_isMusicPlaying) {
-        setState(() => _isMusicLoading = true);
-        await _audioPlayer.stop();
-        await _audioPlayer.play(DeviceFileSource(_localFilePath!));
-        setState(() => _isMusicLoading = false);
+        if (isWindowsNative) {
+          _winAudioProcess?.stdin.writeln('PAUSE|');
+        } else {
+          await _mobileWebPlayer?.pause();
+        }
+        setState(() => _isMusicPlaying = false);
+      } else {
+        if (_audioPosition.inSeconds >= 1 && !_isLiveRadioStream) {
+          if (isWindowsNative) {
+            _winAudioProcess?.stdin.writeln('RESUME|');
+          } else {
+            await _mobileWebPlayer?.resume();
+          }
+          setState(() => _isMusicPlaying = true);
+        } else {
+          await _playCurrentSelection();
+        }
       }
+    } catch (_) {
+      await _playCurrentSelection();
+    }
+  }
+
+  Future _stopMusic() async {
+    try {
+      if (isWindowsNative) {
+        _winAudioProcess?.stdin.writeln('STOP|');
+      } else {
+        await _mobileWebPlayer?.stop();
+      }
+    } catch (_) {}
+    if (mounted) {
+      setState(() {
+        _isMusicPlaying = false;
+        _isMusicLoading = false;
+        _audioPosition = Duration.zero;
+      });
+    }
+  }
+
+  Future _skipTrack(int direction) async {
+    HapticFeedback.selectionClick();
+    if (_selectedStation == 'Local Audio Playlist' && _localPlaylist.isNotEmpty) {
+      setState(() {
+        _currentLocalIndex = (_currentLocalIndex + direction) % _localPlaylist.length;
+        if (_currentLocalIndex <= -1) _currentLocalIndex = _localPlaylist.length - 1;
+      });
+      await _playCurrentSelection();
+    } else {
+      final stationNames = _directStations.keys
+          .where((k) => k != 'Local Audio Playlist')
+          .toList();
+      final currentIdx = stationNames.indexOf(_selectedStation);
+      int nextIdx = (currentIdx + direction) % stationNames.length;
+      if (nextIdx <= -1) nextIdx = stationNames.length - 1;
+      setState(() => _selectedStation = stationNames[nextIdx]);
+      await _playCurrentSelection();
+    }
+  }
+
+  Future _seekRelative(int secondsDelta) async {
+    final int maxSecs = _audioDuration.inSeconds;
+    if (maxSecs <= 1 || _isLiveRadioStream) return;
+    int targetSecs = _audioPosition.inSeconds + secondsDelta;
+    if (targetSecs <= 0) targetSecs = 0;
+    if (targetSecs >= maxSecs - 1) targetSecs = maxSecs - 1;
+    setState(() => _audioPosition = Duration(seconds: targetSecs));
+    if (isWindowsNative) {
+      _winAudioProcess?.stdin.writeln('SEEK|$targetSecs');
+    } else {
+      await _mobileWebPlayer?.seek(Duration(seconds: targetSecs));
+    }
+  }
+
+  void _toggleLoopMode() {
+    setState(() => _isLoopOne = !_isLoopOne);
+  }
+
+  Future _changeStation(Object? newStation) async {
+    if (newStation == null) return;
+    final stationStr = newStation.toString();
+    setState(() => _selectedStation = stationStr);
+    if (stationStr == 'Local Audio Playlist' && _localPlaylist.isEmpty) {
+      await _pickLocalAudioFile();
       return;
     }
-
-    if (_isMusicPlaying) {
-      setState(() => _isMusicLoading = true);
-      await _audioPlayer.stop();
-      await _audioPlayer.play(UrlSource(_directStations[newStation]!));
-      setState(() => _isMusicLoading = false);
-    }
+    await _playCurrentSelection();
   }
 
-  Future<void> _toggleMiniHud() async {
+  Future _toggleMiniHud() async {
     if (!isDesktopPlatform) return;
     if (!_isMiniHud) {
       setState(() => _isMiniHud = true);
@@ -288,7 +489,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     } else {
       setState(() => _isRunning = true);
       _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
-        if (_secondsRemaining > 0) {
+        if (_secondsRemaining >= 1) {
           setState(() => _secondsRemaining--);
         } else {
           _completeSession();
@@ -302,7 +503,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     setState(() => _currentSpills++);
   }
 
-  Future<void> _launchMusicUrl(String urlString) async {
+  Future _launchMusicUrl(String urlString) async {
     final uri = Uri.tryParse(urlString);
     if (uri == null) return;
     if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
@@ -314,22 +515,17 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     }
   }
 
-  /// Help & Direct-to-Developer Feedback Dialog (With PIN-Locked Creator Inbox)
   void _showHelpAndFeedbackDialog() {
-    final nameCtrl = TextEditingController(
-      text: ref.read(studyLogsProvider.notifier).syncId,
-    );
+    final nameCtrl = TextEditingController(text: ref.read(studyLogsProvider.notifier).syncId);
     final msgCtrl = TextEditingController();
     final adminPinCtrl = TextEditingController();
-
     String selectedCategory = 'Feature Request';
     int rating = 5;
     bool isSending = false;
-
     bool isCreatorUnlocked = false;
     bool isUnlocking = false;
     String? unlockError;
-    List<FeedbackItem> unlockedFeedbacks = <FeedbackItem>[];
+    var unlockedFeedbacks = [];
 
     showDialog(
       context: context,
@@ -346,12 +542,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                     children: [
                       Icon(Icons.help_outline, color: Colors.tealAccent),
                       SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          'NeuroFlow Guide & Feedback',
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
+                      Expanded(child: Text('NeuroFlow Guide & Feedback', overflow: TextOverflow.ellipsis)),
                     ],
                   ),
                   SizedBox(height: 8),
@@ -361,16 +552,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                     tabs: [
                       Tab(text: 'Send Feedback'),
                       Tab(text: 'How It Works'),
-                      Tab(
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(Icons.lock_outline, size: 14),
-                            SizedBox(width: 4),
-                            Text('Creator Inbox'),
-                          ],
-                        ),
-                      ),
+                      Tab(text: 'Creator Inbox'),
                     ],
                   ),
                 ],
@@ -380,15 +562,13 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                 height: 360,
                 child: TabBarView(
                   children: [
-                    // TAB 1: SEND FEEDBACK TO PRATYUSH
                     SingleChildScrollView(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           const Text(
-                            'Found a bug or have an idea for NeuroFlow? Your feedback is sent directly to Pratyush\'s Creator Inbox!',
-                            style:
-                                TextStyle(fontSize: 12.5, color: Colors.white70),
+                            'Found a bug or have an idea for NeuroFlow? Your feedback is sent directly to Pratyush!',
+                            style: TextStyle(fontSize: 12.5, color: Colors.white70),
                           ),
                           const SizedBox(height: 12),
                           Row(
@@ -398,33 +578,19 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                                   controller: nameCtrl,
                                   decoration: const InputDecoration(
                                     labelText: 'Your Name / Handle',
-                                    hintText: 'e.g., Rahul',
                                     isDense: true,
                                     border: OutlineInputBorder(),
                                   ),
                                 ),
                               ),
                               const SizedBox(width: 10),
-                              DropdownButton<String>(
+                              DropdownButton(
                                 value: selectedCategory,
-                                items: [
-                                  'Feature Request',
-                                  'Bug Report',
-                                  'UI / Design',
-                                  'Appreciation',
-                                ].map((c) {
-                                  return DropdownMenuItem(
-                                    value: c,
-                                    child: Text(
-                                      c,
-                                      style: const TextStyle(fontSize: 13),
-                                    ),
-                                  );
+                                items: ['Feature Request', 'Bug Report', 'UI / Design', 'Appreciation'].map((c) {
+                                  return DropdownMenuItem(value: c, child: Text(c, style: const TextStyle(fontSize: 13)));
                                 }).toList(),
                                 onChanged: (val) {
-                                  if (val != null) {
-                                    setDialogState(() => selectedCategory = val);
-                                  }
+                                  if (val != null) setDialogState(() => selectedCategory = val.toString());
                                 },
                               ),
                             ],
@@ -432,19 +598,13 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                           const SizedBox(height: 10),
                           Row(
                             children: [
-                              const Text(
-                                'Rating: ',
-                                style: TextStyle(fontSize: 12.5),
-                              ),
-                              ...List.generate(5, (i) {
+                              const Text('Rating: ', style: TextStyle(fontSize: 12.5)),
+                              ...[1, 2, 3, 4, 5].map((star) {
                                 return IconButton(
                                   visualDensity: VisualDensity.compact,
-                                  onPressed: () =>
-                                      setDialogState(() => rating = i + 1),
+                                  onPressed: () => setDialogState(() => rating = star),
                                   icon: Icon(
-                                    i < rating
-                                        ? Icons.star
-                                        : Icons.star_border,
+                                    star <= rating ? Icons.star : Icons.star_border,
                                     color: Colors.amberAccent,
                                     size: 20,
                                   ),
@@ -458,8 +618,6 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                             maxLines: 4,
                             decoration: const InputDecoration(
                               labelText: 'Your Feedback or Suggestion',
-                              hintText:
-                                  'Tell me what you love or what we should add next...',
                               border: OutlineInputBorder(),
                             ),
                           ),
@@ -474,9 +632,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                                     : () async {
                                         if (msgCtrl.text.trim().isEmpty) return;
                                         setDialogState(() => isSending = true);
-                                        final sent = await ref
-                                            .read(studyLogsProvider.notifier)
-                                            .submitFeedbackToCloud(
+                                        final sent = await ref.read(studyLogsProvider.notifier).submitFeedbackToCloud(
                                               sender: nameCtrl.text,
                                               category: selectedCategory,
                                               rating: rating,
@@ -485,42 +641,27 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                                         setDialogState(() => isSending = false);
                                         if (ctx.mounted) {
                                           Navigator.pop(ctx);
-                                          ScaffoldMessenger.of(context)
-                                              .showSnackBar(
+                                          ScaffoldMessenger.of(context).showSnackBar(
                                             SnackBar(
                                               content: Text(
                                                 sent
-                                                    ? '🎉 Feedback delivered straight to Pratyush\'s Cloud Inbox!'
-                                                    : 'Saved! You can also click "Send via Email" to notify Pratyush.',
+                                                    ? 'Feedback delivered straight to Cloud Inbox!'
+                                                    : 'Saved! You can also click Send via Email.',
                                               ),
                                             ),
                                           );
                                         }
                                       },
-                                icon: const Icon(
-                                  Icons.cloud_upload_outlined,
-                                  size: 17,
-                                ),
-                                label: Text(
-                                  isSending
-                                      ? 'Sending...'
-                                      : 'Submit to Creator Inbox',
-                                ),
+                                icon: const Icon(Icons.cloud_upload_outlined, size: 17),
+                                label: Text(isSending ? 'Sending...' : 'Submit to Creator Inbox'),
                               ),
                               OutlinedButton.icon(
                                 onPressed: () async {
-                                  final subject = Uri.encodeComponent(
-                                    '[NeuroFlow $selectedCategory] from ${nameCtrl.text.isEmpty ? "User" : nameCtrl.text} ($rating/5 ★)',
-                                  );
-                                  final body =
-                                      Uri.encodeComponent(msgCtrl.text);
-                                  final mailUri = Uri.parse(
-                                    'mailto:$kDeveloperFeedbackEmail?subject=$subject&body=$body',
-                                  );
-                                  await launchUrl(mailUri);
+                                  final subject = Uri.encodeComponent('[NeuroFlow $selectedCategory] from ${nameCtrl.text}');
+                                  final body = Uri.encodeComponent(msgCtrl.text);
+                                  await launchUrl(Uri.parse('mailto:$kDeveloperFeedbackEmail?subject=$subject&body=$body'));
                                 },
-                                icon:
-                                    const Icon(Icons.email_outlined, size: 16),
+                                icon: const Icon(Icons.email_outlined, size: 16),
                                 label: const Text('Send via Email'),
                               ),
                             ],
@@ -528,144 +669,84 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                         ],
                       ),
                     ),
-
-                    // TAB 2: QUICK GUIDE FOR FRIENDS / USERS
                     ListView(
                       children: const [
                         ListTile(
-                          leading:
-                              Icon(Icons.shuffle, color: Colors.tealAccent),
+                          leading: Icon(Icons.shuffle, color: Colors.tealAccent),
                           title: Text('1. Cognitive Interleaving'),
-                          subtitle: Text(
-                            'Instead of grinding one subject for 6 hours, alternate between 3 subjects (45–90m blocks) to boost long-term retention.',
-                          ),
+                          subtitle: Text('Alternate between 3 subjects (45-90m blocks) to boost long-term retention.'),
                         ),
                         ListTile(
-                          leading: Icon(
-                            Icons.warning_amber_rounded,
-                            color: Colors.orangeAccent,
-                          ),
+                          leading: Icon(Icons.warning_amber_rounded, color: Colors.orangeAccent),
                           title: Text('2. Working Memory Spills'),
-                          subtitle: Text(
-                            'Tap the "Memory Spill" button whenever you catch your mind wandering or checking your phone. NeuroFlow auto-adjusts your next block duration.',
-                          ),
+                          subtitle: Text('Tap Memory Spill whenever your mind wanders. NeuroFlow auto-adjusts your next block.'),
                         ),
                         ListTile(
-                          leading: Icon(
-                            Icons.bookmark_outline,
-                            color: Colors.amberAccent,
-                          ),
+                          leading: Icon(Icons.bookmark_outline, color: Colors.amberAccent),
                           title: Text('3. 5-Word Breadcrumbs'),
-                          subtitle: Text(
-                            'When finishing a block, write a 5-word note on where to start next (e.g. "Start Q15 rotational dynamics"). Your Groq Mentor uses this to quiz and guide you!',
-                          ),
+                          subtitle: Text('Write a 5-word note on where to start next so your Groq Mentor can quiz and guide you.'),
                         ),
                         ListTile(
-                          leading: Icon(
-                            Icons.lock_outline,
-                            color: Colors.tealAccent,
-                          ),
+                          leading: Icon(Icons.lock_outline, color: Colors.tealAccent),
                           title: Text('4. PIN-Protected Cloud Sync'),
-                          subtitle: Text(
-                            'Click the Cloud Sync icon in the top bar and set a unique Username + PIN on both your PC and Android phone to keep your logs mirrored.',
-                          ),
+                          subtitle: Text('Set a unique Username + PIN on PC and Android to mirror your study logs.'),
                         ),
                       ],
                     ),
-
-                    // TAB 3: PIN-LOCKED CREATOR INBOX (ONLY PRATYUSH CAN UNLOCK)
                     if (!isCreatorUnlocked)
                       Center(
-                        child: SingleChildScrollView(
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const Icon(
-                                Icons.admin_panel_settings_outlined,
-                                size: 44,
-                                color: Colors.tealAccent,
-                              ),
-                              const SizedBox(height: 10),
-                              const Text(
-                                'Creator Inbox is PIN-Protected',
-                                style: TextStyle(
-                                  fontSize: 15,
-                                  fontWeight: FontWeight.bold,
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(Icons.admin_panel_settings_outlined, size: 42, color: Colors.tealAccent),
+                            const SizedBox(height: 8),
+                            const Text('Creator Inbox is PIN-Protected', style: TextStyle(fontWeight: FontWeight.bold)),
+                            const SizedBox(height: 12),
+                            SizedBox(
+                              width: 240,
+                              child: TextField(
+                                controller: adminPinCtrl,
+                                obscureText: true,
+                                decoration: InputDecoration(
+                                  labelText: 'Creator PIN',
+                                  errorText: unlockError,
+                                  border: const OutlineInputBorder(),
                                 ),
                               ),
-                              const SizedBox(height: 4),
-                              const Text(
-                                'Restricted to the creator (Pratyush). Enter your secret Creator PIN to read user feedback.',
-                                textAlign: TextAlign.center,
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.white60,
-                                ),
-                              ),
-                              const SizedBox(height: 16),
-                              SizedBox(
-                                width: 260,
-                                child: TextField(
-                                  controller: adminPinCtrl,
-                                  obscureText: true,
-                                  textAlign: TextAlign.center,
-                                  decoration: InputDecoration(
-                                    labelText: 'Creator PIN',
-                                    errorText: unlockError,
-                                    prefixIcon: const Icon(
-                                      Icons.key,
-                                      color: Colors.tealAccent,
-                                    ),
-                                    border: const OutlineInputBorder(),
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(height: 12),
-                              FilledButton.icon(
-                                onPressed: isUnlocking
-                                    ? null
-                                    : () async {
+                            ),
+                            const SizedBox(height: 12),
+                            FilledButton.icon(
+                              onPressed: isUnlocking
+                                  ? null
+                                  : () async {
+                                      setDialogState(() {
+                                        isUnlocking = true;
+                                        unlockError = null;
+                                      });
+                                      try {
+                                        final items = await ref
+                                            .read(studyLogsProvider.notifier)
+                                            .fetchFeedbackInbox(adminPinCtrl.text);
                                         setDialogState(() {
-                                          isUnlocking = true;
-                                          unlockError = null;
+                                          isUnlocking = false;
+                                          isCreatorUnlocked = true;
+                                          unlockedFeedbacks = items;
                                         });
-                                        try {
-                                          final items = await ref
-                                              .read(studyLogsProvider.notifier)
-                                              .fetchFeedbackInbox(
-                                                adminPinCtrl.text,
-                                              );
-                                          setDialogState(() {
-                                            isUnlocking = false;
-                                            isCreatorUnlocked = true;
-                                            unlockedFeedbacks = items;
-                                          });
-                                        } catch (e) {
-                                          setDialogState(() {
-                                            isUnlocking = false;
-                                            unlockError =
-                                                'Invalid Creator PIN!';
-                                          });
-                                        }
-                                      },
-                                icon: const Icon(Icons.lock_open, size: 17),
-                                label: Text(
-                                  isUnlocking
-                                      ? 'Verifying...'
-                                      : 'Unlock Creator Inbox',
-                                ),
-                              ),
-                            ],
-                          ),
+                                      } catch (_) {
+                                        setDialogState(() {
+                                          isUnlocking = false;
+                                          unlockError = 'Invalid Creator PIN!';
+                                        });
+                                      }
+                                    },
+                              icon: const Icon(Icons.lock_open, size: 17),
+                              label: Text(isUnlocking ? 'Verifying...' : 'Unlock Creator Inbox'),
+                            ),
+                          ],
                         ),
                       )
                     else if (unlockedFeedbacks.isEmpty)
-                      const Center(
-                        child: Text(
-                          'Inbox unlocked! No feedback messages submitted yet.',
-                          style: TextStyle(color: Colors.white70),
-                        ),
-                      )
+                      const Center(child: Text('Inbox unlocked! No feedback messages yet.'))
                     else
                       ListView.builder(
                         itemCount: unlockedFeedbacks.length,
@@ -677,10 +758,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                               dense: true,
                               title: Text(
                                 '${fb.sender} • ${fb.category} (${fb.rating}★)',
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.bold,
-                                  color: Colors.tealAccent,
-                                ),
+                                style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.tealAccent),
                               ),
                               subtitle: Text(fb.message),
                             ),
@@ -691,10 +769,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                 ),
               ),
               actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(ctx),
-                  child: const Text('Close'),
-                ),
+                TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close')),
               ],
             ),
           );
@@ -704,77 +779,43 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
   }
 
   void _showStudentProfileDialog() {
-    final currentGoal = ref.read(aiCoachProvider).userProfileGoal;
-    final goalCtrl = TextEditingController(text: currentGoal);
-    final keyCtrl = TextEditingController(
-      text: ref.read(aiCoachProvider.notifier).groqApiKey,
-    );
-
+    final goalCtrl = TextEditingController(text: ref.read(aiCoachProvider).userProfileGoal);
+    final keyCtrl = TextEditingController(text: ref.read(aiCoachProvider.notifier).groqApiKey);
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Row(
-          children: [
-            Icon(Icons.psychology, color: Colors.tealAccent),
-            SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                'Personalize Groq Mentor & Goals',
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-          ],
-        ),
+        title: const Text('Personalize Groq Mentor & Goals'),
         content: SizedBox(
           width: 440,
-          child: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'Tell your Groq Mentor your grade, target exams, and preferred learning style so every doubt explanation and study plan is tailored to you:',
-                  style: TextStyle(fontSize: 12, color: Colors.white70),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: goalCtrl,
+                maxLines: 3,
+                decoration: const InputDecoration(
+                  labelText: 'Your Academic Profile & Learning Style',
+                  border: OutlineInputBorder(),
                 ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: goalCtrl,
-                  maxLines: 3,
-                  decoration: const InputDecoration(
-                    labelText: 'Your Academic Profile & Learning Style',
-                    hintText:
-                        'e.g., Class 11 PCM + CS student preparing for JEE 2028 & SAT. Explain concepts from first principles.',
-                    border: OutlineInputBorder(),
-                  ),
+              ),
+              const SizedBox(height: 14),
+              TextField(
+                controller: keyCtrl,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: 'Custom Groq Key (Optional - gsk_...)',
+                  border: OutlineInputBorder(),
                 ),
-                const SizedBox(height: 16),
-                TextField(
-                  controller: keyCtrl,
-                  obscureText: true,
-                  decoration: const InputDecoration(
-                    labelText: 'Custom Groq Key (Optional - gsk_...)',
-                    hintText: 'Leave empty to use default NeuroFlow Groq Cloud',
-                    prefixIcon: Icon(Icons.vpn_key_outlined, size: 18),
-                    border: OutlineInputBorder(),
-                  ),
-                ),
-              ],
-            ),
+              ),
+            ],
           ),
         ),
         actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
-          ),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
           FilledButton(
             onPressed: () async {
-              await ref
-                  .read(aiCoachProvider.notifier)
-                  .saveUserProfileGoal(goalCtrl.text);
-              await ref
-                  .read(aiCoachProvider.notifier)
-                  .saveGroqApiKey(keyCtrl.text);
+              await ref.read(aiCoachProvider.notifier).saveUserProfileGoal(goalCtrl.text);
+              await ref.read(aiCoachProvider.notifier).saveGroqApiKey(keyCtrl.text);
               if (ctx.mounted) Navigator.pop(ctx);
             },
             child: const Text('Save Profile'),
@@ -788,7 +829,6 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     final currentMusic = ref.read(musicSettingsProvider);
     final spCtrl = TextEditingController(text: currentMusic.spotifyUrl);
     final ytCtrl = TextEditingController(text: currentMusic.ytMusicUrl);
-
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -800,35 +840,21 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
             children: [
               TextField(
                 controller: spCtrl,
-                decoration: const InputDecoration(
-                  labelText: 'Spotify Playlist / Track URL',
-                  prefixIcon: Icon(Icons.album, color: Colors.greenAccent),
-                  border: OutlineInputBorder(),
-                ),
+                decoration: const InputDecoration(labelText: 'Spotify URL', border: OutlineInputBorder()),
               ),
               const SizedBox(height: 12),
               TextField(
                 controller: ytCtrl,
-                decoration: const InputDecoration(
-                  labelText: 'YouTube Music Playlist / Search URL',
-                  prefixIcon:
-                      Icon(Icons.play_circle_fill, color: Colors.redAccent),
-                  border: OutlineInputBorder(),
-                ),
+                decoration: const InputDecoration(labelText: 'YouTube Music URL', border: OutlineInputBorder()),
               ),
             ],
           ),
         ),
         actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
-          ),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
           FilledButton(
             onPressed: () {
-              ref
-                  .read(musicSettingsProvider.notifier)
-                  .updateUrls(spCtrl.text, ytCtrl.text);
+              ref.read(musicSettingsProvider.notifier).updateUrls(spCtrl.text, ytCtrl.text);
               Navigator.pop(ctx);
             },
             child: const Text('Save Links'),
@@ -842,67 +868,33 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     final notifier = ref.read(studyLogsProvider.notifier);
     final syncIdCtrl = TextEditingController(text: notifier.syncId);
     final syncPinCtrl = TextEditingController(text: notifier.syncPin);
-
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Row(
-          children: [
-            Icon(Icons.lock_outline, color: Colors.tealAccent),
-            SizedBox(width: 10),
-            Expanded(
-              child: Text(
-                'PIN-Protected Cloud Sync',
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-          ],
-        ),
+        title: const Text('PIN-Protected Cloud Sync'),
         content: SizedBox(
           width: 420,
           child: Column(
             mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text(
-                'Your Sync ID is locked to the first PIN/Password you set. Nobody can view or overwrite your logs without your PIN.',
-                style: TextStyle(fontSize: 13, color: Colors.white70),
-              ),
-              const SizedBox(height: 16),
               TextField(
                 controller: syncIdCtrl,
-                decoration: const InputDecoration(
-                  labelText: 'Sync ID / Username',
-                  hintText: 'e.g., pratyush',
-                  prefixIcon:
-                      Icon(Icons.person_outline, color: Colors.tealAccent),
-                  border: OutlineInputBorder(),
-                ),
+                decoration: const InputDecoration(labelText: 'Sync ID / Username', border: OutlineInputBorder()),
               ),
               const SizedBox(height: 12),
               TextField(
                 controller: syncPinCtrl,
                 obscureText: true,
-                decoration: const InputDecoration(
-                  labelText: 'Secret PIN / Password',
-                  hintText: 'Enter a 4+ digit PIN or password',
-                  prefixIcon: Icon(Icons.password, color: Colors.tealAccent),
-                  border: OutlineInputBorder(),
-                ),
+                decoration: const InputDecoration(labelText: 'Secret PIN / Password', border: OutlineInputBorder()),
               ),
             ],
           ),
         ),
         actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Close'),
-          ),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close')),
           FilledButton.icon(
             onPressed: () async {
-              await ref
-                  .read(studyLogsProvider.notifier)
-                  .configureCloudflareSync(syncIdCtrl.text, syncPinCtrl.text);
+              await ref.read(studyLogsProvider.notifier).configureCloudflareSync(syncIdCtrl.text, syncPinCtrl.text);
               if (ctx.mounted) Navigator.pop(ctx);
             },
             icon: const Icon(Icons.sync_lock, size: 18),
@@ -917,36 +909,29 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     _timer?.cancel();
     HapticFeedback.heavyImpact();
     setState(() => _isRunning = false);
-
-    if (_isMiniHud) {
-      _toggleMiniHud();
-    }
+    if (_isMiniHud) _toggleMiniHud();
 
     if (_isBreakMode) {
       final nextStudyMins = ref.read(recommendedDurationProvider);
       _setTimerDuration(nextStudyMins, isBreak: false);
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content:
-              Text('Break complete! Ready for your next interleaved block.'),
-        ),
+        const SnackBar(content: Text('Break complete! Ready for your next interleaved block.')),
       );
       return;
     }
 
     final elapsedMins = _initialMinutes - (_secondsRemaining ~/ 60);
-    final actualDuration = elapsedMins > 0 ? elapsedMins : _initialMinutes;
+    final actualDuration = elapsedMins >= 1 ? elapsedMins : _initialMinutes;
 
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
+      useSafeArea: true,
       builder: (_) => LogBottomSheet(
         subject: _selectedSubject,
         durationMinutes: actualDuration,
         memorySpills: _currentSpills,
-        onSaved: (nextBreakMins) {
-          _setTimerDuration(nextBreakMins, isBreak: true);
-        },
+        onSaved: (nextBreakMins) => _setTimerDuration(nextBreakMins, isBreak: true),
       ),
     );
   }
@@ -960,16 +945,10 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
         content: TextField(
           controller: ctrl,
           autofocus: true,
-          decoration: const InputDecoration(
-            hintText: 'e.g., Kalaripayattu, Organic Chem, DSA',
-            border: OutlineInputBorder(),
-          ),
+          decoration: const InputDecoration(hintText: 'e.g., Organic Chem, DSA', border: OutlineInputBorder()),
         ),
         actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
-          ),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
           FilledButton(
             onPressed: () {
               if (ctrl.text.trim().isNotEmpty) {
@@ -992,39 +971,27 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
   }
 
   Widget _buildFormattedMessageText(String rawText) {
-    final RegExp boldPattern = RegExp(r'\*\*([^*]+)\*\*');
-    final List<TextSpan> spans = [];
+    final boldPattern = RegExp(r'\*\*([^*]+)\*\*');
+    final spans = [const TextSpan(text: '')];
     int currentIndex = 0;
-
     for (final match in boldPattern.allMatches(rawText)) {
-      if (match.start > currentIndex) {
-        spans.add(
-          TextSpan(text: rawText.substring(currentIndex, match.start)),
-        );
+      if (match.start != currentIndex) {
+        spans.add(TextSpan(text: rawText.substring(currentIndex, match.start)));
       }
       spans.add(
         TextSpan(
           text: match.group(1),
-          style: const TextStyle(
-            fontWeight: FontWeight.w700,
-            color: Colors.tealAccent,
-          ),
+          style: const TextStyle(fontWeight: FontWeight.w700, color: Colors.tealAccent),
         ),
       );
       currentIndex = match.end;
     }
-
-    if (currentIndex < rawText.length) {
+    if (currentIndex != rawText.length) {
       spans.add(TextSpan(text: rawText.substring(currentIndex)));
     }
-
     return SelectableText.rich(
       TextSpan(
-        style: const TextStyle(
-          fontSize: 12.8,
-          color: Color(0xFFEFF3F6),
-          height: 1.48,
-        ),
+        style: const TextStyle(fontSize: 12.8, color: Color(0xFFEFF3F6), height: 1.48),
         children: spans,
       ),
     );
@@ -1033,7 +1000,9 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
   @override
   void dispose() {
     _timer?.cancel();
-    _audioPlayer.dispose();
+    _winStdoutSub?.cancel();
+    _winAudioProcess?.kill(ProcessSignal.sigterm);
+    _mobileWebPlayer?.dispose();
     _doubtCtrl.dispose();
     _chatScrollCtrl.dispose();
     super.dispose();
@@ -1041,9 +1010,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
 
   @override
   Widget build(BuildContext context) {
-    if (_isMiniHud) {
-      return _buildMiniHudScaffold();
-    }
+    if (_isMiniHud) return _buildMiniHudScaffold();
 
     final logs = ref.watch(studyLogsProvider);
     final subjects = ref.watch(subjectsProvider);
@@ -1071,47 +1038,28 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
           child: AppBar(
             backgroundColor: const Color(0xFF14181B),
             elevation: 0,
-            leading: const Icon(
-              Icons.hub_outlined,
-              color: Colors.tealAccent,
-              size: 20,
-            ),
+            leading: const Icon(Icons.hub_outlined, color: Colors.tealAccent, size: 20),
             titleSpacing: 0,
             title: Row(
               children: [
-                const Text(
-                  'NeuroFlow',
-                  style: TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 0.5,
-                  ),
-                ),
+                const Text('NeuroFlow', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
                 const SizedBox(width: 8),
                 Flexible(
                   child: InkWell(
                     onTap: _showCloudSyncDialog,
                     borderRadius: BorderRadius.circular(12),
                     child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 3,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.white10,
-                        borderRadius: BorderRadius.circular(12),
-                      ),
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                      decoration: BoxDecoration(color: Colors.white10, borderRadius: BorderRadius.circular(12)),
                       child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           Icon(
-                            syncStatus.contains('Synced') ||
-                                    syncStatus.contains('Connected')
+                            syncStatus.contains('Synced') || syncStatus.contains('Connected')
                                 ? Icons.cloud_done
                                 : Icons.cloud_off,
                             size: 13,
-                            color: syncStatus.contains('Synced') ||
-                                    syncStatus.contains('Connected')
+                            color: syncStatus.contains('Synced') || syncStatus.contains('Connected')
                                 ? Colors.tealAccent
                                 : Colors.white54,
                           ),
@@ -1121,10 +1069,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                               syncStatus,
                               overflow: TextOverflow.ellipsis,
                               maxLines: 1,
-                              style: const TextStyle(
-                                fontSize: 11,
-                                color: Colors.white70,
-                              ),
+                              style: const TextStyle(fontSize: 11, color: Colors.white70),
                             ),
                           ),
                         ],
@@ -1138,11 +1083,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
               if (isDesktopPlatform)
                 IconButton(
                   tooltip: 'Pin Always-On-Top Mini HUD',
-                  icon: const Icon(
-                    Icons.picture_in_picture_alt_outlined,
-                    size: 19,
-                    color: Colors.tealAccent,
-                  ),
+                  icon: const Icon(Icons.picture_in_picture_alt_outlined, size: 19, color: Colors.tealAccent),
                   onPressed: _toggleMiniHud,
                 ),
               IconButton(
@@ -1152,10 +1093,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
               ),
               IconButton(
                 tooltip: 'Switch Study / Break Mode',
-                icon: Icon(
-                  _isBreakMode ? Icons.self_improvement : Icons.psychology,
-                  size: 20,
-                ),
+                icon: Icon(_isBreakMode ? Icons.self_improvement : Icons.psychology, size: 20),
                 onPressed: _isRunning
                     ? null
                     : () {
@@ -1168,22 +1106,16 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
               ),
               IconButton(
                 tooltip: 'Help & Send Feedback',
-                icon: const Icon(
-                  Icons.help_outline_rounded,
-                  size: 19,
-                  color: Colors.amberAccent,
-                ),
+                icon: const Icon(Icons.help_outline_rounded, size: 19, color: Colors.amberAccent),
                 onPressed: _showHelpAndFeedbackDialog,
               ),
               if (isDesktopPlatform) ...[
                 const SizedBox(width: 8),
                 IconButton(
-                  tooltip: 'Minimize',
                   icon: const Icon(Icons.minimize, size: 18),
                   onPressed: () => windowManager.minimize(),
                 ),
                 IconButton(
-                  tooltip: 'Maximize / Restore',
                   icon: const Icon(Icons.crop_square, size: 16),
                   onPressed: () async {
                     if (await windowManager.isMaximized()) {
@@ -1194,7 +1126,6 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                   },
                 ),
                 IconButton(
-                  tooltip: 'Close',
                   hoverColor: Colors.redAccent,
                   icon: const Icon(Icons.close, size: 18),
                   onPressed: () => windowManager.close(),
@@ -1208,7 +1139,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final isDesktop = constraints.maxWidth > 850;
+            final isDesktop = constraints.maxWidth >= 850;
             if (isDesktop) {
               return Padding(
                 padding: const EdgeInsets.all(16.0),
@@ -1231,20 +1162,14 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                     const VerticalDivider(width: 32),
                     Expanded(
                       flex: 6,
-                      child: _buildAnalyticsAndLogsPanel(
-                        logs,
-                        isDesktop: true,
-                      ),
+                      child: _buildAnalyticsAndLogsPanel(logs, isDesktop: true),
                     ),
                   ],
                 ),
               );
             } else {
               return SingleChildScrollView(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12.0,
-                  vertical: 14.0,
-                ),
+                padding: const EdgeInsets.symmetric(horizontal: 12.0, vertical: 14.0),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
@@ -1257,10 +1182,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                       isMobile: true,
                     ),
                     const Divider(height: 36),
-                    _buildAnalyticsAndLogsPanel(
-                      logs,
-                      isDesktop: false,
-                    ),
+                    _buildAnalyticsAndLogsPanel(logs, isDesktop: false),
                   ],
                 ),
               );
@@ -1279,10 +1201,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
         onPanStart: (_) => windowManager.startDragging(),
         child: Container(
           decoration: BoxDecoration(
-            border: Border.all(
-              color: accentColor.withValues(alpha: 0.5),
-              width: 1.5,
-            ),
+            border: Border.all(color: accentColor.withValues(alpha: 0.5), width: 1.5),
           ),
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
           child: Column(
@@ -1297,35 +1216,41 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                       const SizedBox(width: 6),
                       Text(
                         _isBreakMode ? 'RECOVERY BREAK' : _selectedSubject,
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                          color: accentColor,
-                        ),
+                        style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: accentColor),
                       ),
                     ],
                   ),
                   Row(
                     children: [
                       IconButton(
-                        tooltip: 'Toggle Focus Music',
+                        visualDensity: VisualDensity.compact,
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(),
+                        icon: const Icon(Icons.skip_previous_rounded, size: 16, color: Colors.white54),
+                        onPressed: () => _skipTrack(-1),
+                      ),
+                      const SizedBox(width: 6),
+                      IconButton(
                         visualDensity: VisualDensity.compact,
                         padding: EdgeInsets.zero,
                         constraints: const BoxConstraints(),
                         icon: Icon(
-                          _isMusicPlaying
-                              ? Icons.music_note
-                              : Icons.music_off_outlined,
+                          _isMusicPlaying ? Icons.music_note : Icons.music_off_outlined,
                           size: 16,
-                          color: _isMusicPlaying
-                              ? Colors.tealAccent
-                              : Colors.white54,
+                          color: _isMusicPlaying ? Colors.tealAccent : Colors.white54,
                         ),
                         onPressed: _toggleDirectMusic,
                       ),
+                      const SizedBox(width: 6),
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(),
+                        icon: const Icon(Icons.skip_next_rounded, size: 16, color: Colors.white54),
+                        onPressed: () => _skipTrack(1),
+                      ),
                       const SizedBox(width: 10),
                       IconButton(
-                        tooltip: 'Expand Full Workstation',
                         visualDensity: VisualDensity.compact,
                         padding: EdgeInsets.zero,
                         constraints: const BoxConstraints(),
@@ -1349,36 +1274,21 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                 mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                 children: [
                   FilledButton.tonalIcon(
-                    style: FilledButton.styleFrom(
-                      visualDensity: VisualDensity.compact,
-                    ),
+                    style: FilledButton.styleFrom(visualDensity: VisualDensity.compact),
                     onPressed: _toggleTimer,
-                    icon: Icon(
-                      _isRunning ? Icons.pause : Icons.play_arrow,
-                      size: 16,
-                    ),
+                    icon: Icon(_isRunning ? Icons.pause : Icons.play_arrow, size: 16),
                     label: Text(_isRunning ? 'Pause' : 'Start'),
                   ),
                   if (!_isBreakMode)
                     OutlinedButton.icon(
-                      style: OutlinedButton.styleFrom(
-                        visualDensity: VisualDensity.compact,
-                      ),
+                      style: OutlinedButton.styleFrom(visualDensity: VisualDensity.compact),
                       onPressed: _incrementSpill,
-                      icon: const Icon(
-                        Icons.warning_amber_rounded,
-                        size: 15,
-                        color: Colors.orangeAccent,
-                      ),
+                      icon: const Icon(Icons.warning_amber_rounded, size: 15, color: Colors.orangeAccent),
                       label: Text('Spill ($_currentSpills)'),
                     ),
                   IconButton(
-                    tooltip: 'Finish & Log',
                     visualDensity: VisualDensity.compact,
-                    icon: const Icon(
-                      Icons.check_circle_outline,
-                      color: Colors.tealAccent,
-                    ),
+                    icon: const Icon(Icons.check_circle_outline, color: Colors.tealAccent),
                     onPressed: _completeSession,
                   ),
                 ],
@@ -1391,8 +1301,8 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
   }
 
   Widget _buildTimerPanel(
-    List<StudyBlockLog> logs,
-    List<String> subjects,
+    List logs,
+    List subjects,
     int recommendedMins,
     int recommendedBreak,
     MusicSettings musicSettings, {
@@ -1400,37 +1310,33 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
   }) {
     final accentColor = _isBreakMode ? Colors.amberAccent : Colors.tealAccent;
     final aiState = ref.watch(aiCoachProvider);
+    final latestSubjectLog = logs.where((l) => l.subject == _selectedSubject).firstOrNull;
 
-    final latestSubjectLog =
-        logs.where((l) => l.subject == _selectedSubject).firstOrNull;
+    final int durSecs = _audioDuration.inSeconds;
+    final int posSecs = _audioPosition.inSeconds;
+    final bool canSeek = !_isLiveRadioStream && durSecs >= 2 && durSecs <= 86400;
+    final double maxSecs = canSeek ? durSecs.toDouble() : 100.0;
+    double curSecs = 0.0;
+    if (canSeek && posSecs >= 0) {
+      curSecs = posSecs <= durSecs ? posSecs.toDouble() : durSecs.toDouble();
+    }
 
     return Column(
       children: [
         Card(
           color: accentColor.withValues(alpha: 0.12),
           child: ListTile(
-            contentPadding: const EdgeInsets.symmetric(
-              horizontal: 12,
-              vertical: 4,
-            ),
-            leading: Icon(
-              _isBreakMode ? Icons.coffee : Icons.bolt,
-              color: accentColor,
-            ),
+            contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            leading: Icon(_isBreakMode ? Icons.coffee : Icons.bolt, color: accentColor),
             title: Text(
               _isBreakMode
                   ? 'Active Recovery Break ($recommendedBreak mins)'
                   : 'Recommended Next Block: $recommendedMins mins',
-              style: const TextStyle(
-                fontWeight: FontWeight.bold,
-                fontSize: 14,
-              ),
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
             ),
             subtitle: Text(
               _isBreakMode
-                  ? (recommendedBreak >= 25
-                      ? 'High strain: Perform 20m NSDR or take a zero-screen walk.'
-                      : 'Step away from screens. Hydrate & do light mobility.')
+                  ? 'Step away from screens. Hydrate & do light mobility.'
                   : (logs.isEmpty
                       ? 'No blocks logged yet today.'
                       : 'Last fatigue: ${logs.first.fatigueScore}/5 (${logs.first.subject}) • Spills: ${logs.first.memorySpills}'),
@@ -1453,13 +1359,10 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
             alignment: WrapAlignment.center,
             children: [
               ...subjects.map((subject) {
-                final isSelected = _selectedSubject == subject;
                 return ChoiceChip(
-                  label: Text(subject),
-                  selected: isSelected,
-                  onSelected: _isRunning
-                      ? null
-                      : (_) => setState(() => _selectedSubject = subject),
+                  label: Text(subject.toString()),
+                  selected: _selectedSubject == subject,
+                  onSelected: _isRunning ? null : (_) => setState(() => _selectedSubject = subject.toString()),
                 );
               }),
               ActionChip(
@@ -1477,15 +1380,8 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
             borderRadius: BorderRadius.circular(20),
           ),
           child: Text(
-            _isBreakMode
-                ? 'RECOVERY & NSDR MODE'
-                : 'DEEP FOCUS: $_selectedSubject',
-            style: TextStyle(
-              color: accentColor,
-              fontWeight: FontWeight.bold,
-              fontSize: 12,
-              letterSpacing: 1.1,
-            ),
+            _isBreakMode ? 'RECOVERY & NSDR MODE' : 'DEEP FOCUS: $_selectedSubject',
+            style: TextStyle(color: accentColor, fontWeight: FontWeight.bold, fontSize: 12, letterSpacing: 1.1),
           ),
         ),
         const SizedBox(height: 4),
@@ -1506,9 +1402,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
           alignment: WrapAlignment.center,
           children: (_isBreakMode ? [10, 15, 25] : [45, 75, 90]).map((mins) {
             return OutlinedButton(
-              onPressed: _isRunning
-                  ? null
-                  : () => _setTimerDuration(mins, isBreak: _isBreakMode),
+              onPressed: _isRunning ? null : () => _setTimerDuration(mins, isBreak: _isBreakMode),
               child: Text('${mins}m'),
             );
           }).toList(),
@@ -1519,15 +1413,8 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
             padding: const EdgeInsets.only(bottom: 10.0),
             child: OutlinedButton.icon(
               onPressed: _incrementSpill,
-              icon: const Icon(
-                Icons.warning_amber_rounded,
-                color: Colors.orangeAccent,
-                size: 18,
-              ),
-              label: Text(
-                'Memory Spill / Distraction ($_currentSpills)',
-                style: const TextStyle(fontSize: 13),
-              ),
+              icon: const Icon(Icons.warning_amber_rounded, color: Colors.orangeAccent, size: 18),
+              label: Text('Memory Spill / Distraction ($_currentSpills)', style: const TextStyle(fontSize: 13)),
             ),
           ),
         Wrap(
@@ -1538,11 +1425,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
             FilledButton.icon(
               onPressed: _toggleTimer,
               icon: Icon(_isRunning ? Icons.pause : Icons.play_arrow),
-              label: Text(
-                _isRunning
-                    ? 'Pause'
-                    : (_isBreakMode ? 'Start Break' : 'Start Block'),
-              ),
+              label: Text(_isRunning ? 'Pause' : (_isBreakMode ? 'Start Break' : 'Start Block')),
             ),
             TextButton.icon(
               onPressed: _completeSession,
@@ -1552,15 +1435,12 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
           ],
         ),
         const SizedBox(height: 14),
-
         Card(
           color: Colors.white.withValues(alpha: 0.05),
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(14),
             side: BorderSide(
-              color: _isMusicPlaying
-                  ? Colors.tealAccent.withValues(alpha: 0.5)
-                  : Colors.white12,
+              color: _isMusicPlaying ? Colors.tealAccent.withValues(alpha: 0.5) : Colors.white12,
             ),
           ),
           child: Padding(
@@ -1570,40 +1450,30 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
               children: [
                 Row(
                   children: [
-                    IconButton.filledTonal(
-                      onPressed: _isMusicLoading ? null : _toggleDirectMusic,
-                      icon: _isMusicLoading
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : Icon(
-                              _isMusicPlaying ? Icons.pause : Icons.play_arrow,
-                            ),
-                    ),
-                    const SizedBox(width: 10),
+                    const Icon(Icons.graphic_eq, size: 18, color: Colors.tealAccent),
+                    const SizedBox(width: 8),
                     Expanded(
                       child: DropdownButtonHideUnderline(
-                        child: DropdownButton<String>(
+                        child: DropdownButton(
                           value: _selectedStation,
                           isExpanded: true,
                           isDense: true,
                           items: _directStations.keys.map((station) {
-                            final label = (station == 'Local Audio File' &&
-                                    _localFileName != null)
-                                ? 'Local: $_localFileName'
-                                : 'In-App: $station';
+                            String label = 'Track: $station';
+                            if (station == '24/7 Live Lofi Radio') {
+                              label = 'Live Stream: $station';
+                            } else if (station == 'Local Audio Playlist') {
+                              label = _localPlaylist.isEmpty
+                                  ? 'Local Audio Playlist (Pick Files)'
+                                  : 'Local (${_currentLocalIndex + 1}/${_localPlaylist.length}): ${_localPlaylist[_currentLocalIndex]['name']}';
+                            }
                             return DropdownMenuItem(
                               value: station,
                               child: Text(
                                 label,
                                 overflow: TextOverflow.ellipsis,
                                 maxLines: 1,
-                                style: const TextStyle(
-                                  fontSize: 13,
-                                  fontWeight: FontWeight.w600,
-                                ),
+                                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
                               ),
                             );
                           }).toList(),
@@ -1611,46 +1481,149 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                         ),
                       ),
                     ),
-                    if (!isMobile) ...[
-                      const Icon(
-                        Icons.volume_down,
-                        size: 16,
-                        color: Colors.white54,
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: _isMusicPlaying ? Colors.tealAccent.withValues(alpha: 0.18) : Colors.white10,
+                        borderRadius: BorderRadius.circular(8),
                       ),
-                      SizedBox(
-                        width: 85,
-                        child: Slider(
-                          value: _volume,
-                          min: 0.0,
-                          max: 1.0,
-                          onChanged: (val) {
-                            setState(() => _volume = val);
-                            _audioPlayer.setVolume(val);
-                          },
+                      child: Text(
+                        _isLiveRadioStream
+                            ? 'LIVE'
+                            : (_isLoopOne ? 'LOOP 1' : 'AUTO-NEXT'),
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                          color: _isMusicPlaying ? Colors.tealAccent : Colors.white54,
                         ),
                       ),
-                    ],
+                    ),
                   ],
                 ),
-                if (isMobile)
+                const SizedBox(height: 8),
+                Wrap(
+                  alignment: WrapAlignment.spaceBetween,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  spacing: 4,
+                  runSpacing: 6,
+                  children: [
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        IconButton(
+                          tooltip: 'Previous Track',
+                          visualDensity: VisualDensity.compact,
+                          onPressed: () => _skipTrack(-1),
+                          icon: const Icon(Icons.skip_previous_rounded, size: 20),
+                        ),
+                        IconButton(
+                          tooltip: 'Rewind 10s',
+                          visualDensity: VisualDensity.compact,
+                          onPressed: canSeek ? () => _seekRelative(-10) : null,
+                          icon: const Icon(Icons.replay_10_rounded, size: 18),
+                        ),
+                        IconButton.filledTonal(
+                          onPressed: _isMusicLoading ? null : _toggleDirectMusic,
+                          icon: _isMusicLoading
+                              ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                )
+                              : Icon(_isMusicPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded),
+                        ),
+                        IconButton(
+                          tooltip: 'Forward 10s',
+                          visualDensity: VisualDensity.compact,
+                          onPressed: canSeek ? () => _seekRelative(10) : null,
+                          icon: const Icon(Icons.forward_10_rounded, size: 18),
+                        ),
+                        IconButton(
+                          tooltip: 'Next Track',
+                          visualDensity: VisualDensity.compact,
+                          onPressed: () => _skipTrack(1),
+                          icon: const Icon(Icons.skip_next_rounded, size: 20),
+                        ),
+                        IconButton(
+                          tooltip: 'Stop Audio',
+                          visualDensity: VisualDensity.compact,
+                          onPressed: _isMusicPlaying ? _stopMusic : null,
+                          icon: const Icon(Icons.stop_rounded, size: 19),
+                        ),
+                        if (!_isLiveRadioStream)
+                          IconButton(
+                            tooltip: 'Toggle Loop Mode',
+                            visualDensity: VisualDensity.compact,
+                            onPressed: _toggleLoopMode,
+                            icon: Icon(
+                              _isLoopOne ? Icons.repeat_one_rounded : Icons.repeat_rounded,
+                              size: 18,
+                              color: Colors.tealAccent,
+                            ),
+                          ),
+                      ],
+                    ),
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          _volume == 0 ? Icons.volume_off_rounded : Icons.volume_up_rounded,
+                          size: 16,
+                          color: Colors.white54,
+                        ),
+                        SizedBox(
+                          width: isMobile ? 110 : 95,
+                          child: Slider(
+                            value: _volume,
+                            min: 0.0,
+                            max: 1.0,
+                            onChanged: (val) {
+                              setState(() => _volume = val);
+                              if (isWindowsNative) {
+                                _winAudioProcess?.stdin.writeln('VOL|$val');
+                              } else {
+                                _mobileWebPlayer?.setVolume(val);
+                              }
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+                if (!_isLiveRadioStream)
                   Row(
                     children: [
-                      const SizedBox(width: 8),
-                      const Icon(
-                        Icons.volume_down,
-                        size: 16,
-                        color: Colors.white54,
+                      Text(
+                        _formatAudioDuration(_audioPosition),
+                        style: const TextStyle(fontSize: 10.5, color: Colors.white60),
                       ),
                       Expanded(
                         child: Slider(
-                          value: _volume,
+                          value: curSecs,
                           min: 0.0,
-                          max: 1.0,
-                          onChanged: (val) {
-                            setState(() => _volume = val);
-                            _audioPlayer.setVolume(val);
-                          },
+                          max: maxSecs,
+                          onChangeStart: canSeek ? (_) => _isSeeking = true : null,
+                          onChanged: canSeek
+                              ? (sec) => setState(() => _audioPosition = Duration(seconds: sec.toInt()))
+                              : null,
+                          onChangeEnd: canSeek
+                              ? (sec) async {
+                                  final target = sec.toInt();
+                                  if (isWindowsNative) {
+                                    _winAudioProcess?.stdin.writeln('SEEK|$target');
+                                  } else {
+                                    await _mobileWebPlayer?.seek(Duration(seconds: target));
+                                  }
+                                  _isSeeking = false;
+                                }
+                              : null,
                         ),
+                      ),
+                      Text(
+                        _formatAudioDuration(_audioDuration),
+                        style: const TextStyle(fontSize: 10.5, color: Colors.white60),
                       ),
                     ],
                   ),
@@ -1662,14 +1635,12 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                   crossAxisAlignment: WrapCrossAlignment.center,
                   children: [
                     OutlinedButton.icon(
-                      style: OutlinedButton.styleFrom(
-                        visualDensity: VisualDensity.compact,
-                      ),
+                      style: OutlinedButton.styleFrom(visualDensity: VisualDensity.compact),
                       onPressed: _pickLocalAudioFile,
-                      icon: const Icon(Icons.folder_open, size: 15),
-                      label: const Text(
-                        'Local File',
-                        style: TextStyle(fontSize: 11),
+                      icon: const Icon(Icons.library_music_outlined, size: 15),
+                      label: Text(
+                        _localPlaylist.isEmpty ? 'Add Local Songs' : 'Queue (${_localPlaylist.length} Songs)',
+                        style: const TextStyle(fontSize: 11),
                       ),
                     ),
                     Wrap(
@@ -1679,18 +1650,13 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                       children: [
                         FilledButton.tonalIcon(
                           style: FilledButton.styleFrom(
-                            backgroundColor:
-                                Colors.green.withValues(alpha: 0.2),
+                            backgroundColor: Colors.green.withValues(alpha: 0.2),
                             foregroundColor: Colors.greenAccent,
                             visualDensity: VisualDensity.compact,
                           ),
-                          onPressed: () =>
-                              _launchMusicUrl(musicSettings.spotifyUrl),
+                          onPressed: () => _launchMusicUrl(musicSettings.spotifyUrl),
                           icon: const Icon(Icons.album, size: 14),
-                          label: const Text(
-                            'Spotify',
-                            style: TextStyle(fontSize: 11),
-                          ),
+                          label: const Text('Spotify', style: TextStyle(fontSize: 11)),
                         ),
                         FilledButton.tonalIcon(
                           style: FilledButton.styleFrom(
@@ -1698,13 +1664,9 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                             foregroundColor: Colors.redAccent,
                             visualDensity: VisualDensity.compact,
                           ),
-                          onPressed: () =>
-                              _launchMusicUrl(musicSettings.ytMusicUrl),
+                          onPressed: () => _launchMusicUrl(musicSettings.ytMusicUrl),
                           icon: const Icon(Icons.play_circle_fill, size: 14),
-                          label: const Text(
-                            'YT Music',
-                            style: TextStyle(fontSize: 11),
-                          ),
+                          label: const Text('YT Music', style: TextStyle(fontSize: 11)),
                         ),
                         IconButton(
                           tooltip: 'Customize Playlist Links',
@@ -1721,94 +1683,62 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
           ),
         ),
         const SizedBox(height: 12),
-
         Card(
           color: const Color(0xFF1A162B),
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(16),
-            side: BorderSide(
-              color: Colors.tealAccent.withValues(alpha: 0.35),
-              width: 1.2,
-            ),
+            side: BorderSide(color: Colors.tealAccent.withValues(alpha: 0.35), width: 1.2),
           ),
           child: Padding(
             padding: const EdgeInsets.all(12.0),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  alignment: WrapAlignment.spaceBetween,
-                  crossAxisAlignment: WrapCrossAlignment.center,
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(
-                          Icons.auto_awesome,
-                          size: 18,
-                          color: Colors.tealAccent,
-                        ),
-                        const SizedBox(width: 6),
-                        Flexible(
-                          child: Text(
-                            'Groq $_selectedSubject Mentor & Planner',
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              fontSize: 13.5,
-                              fontWeight: FontWeight.bold,
+                    Flexible(
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.auto_awesome, size: 18, color: Colors.tealAccent),
+                          const SizedBox(width: 6),
+                          Flexible(
+                            child: Text(
+                              'Groq $_selectedSubject Mentor & Planner',
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.bold),
                             ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
                     Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         IconButton(
-                          tooltip: 'Personalize Student Profile & Groq Key',
                           visualDensity: VisualDensity.compact,
-                          icon: const Icon(
-                            Icons.person_pin_outlined,
-                            size: 18,
-                            color: Colors.tealAccent,
-                          ),
+                          icon: const Icon(Icons.person_pin_outlined, size: 18, color: Colors.tealAccent),
                           onPressed: _showStudentProfileDialog,
                         ),
                         IconButton(
-                          tooltip: 'Clear Chat History',
                           visualDensity: VisualDensity.compact,
-                          icon: const Icon(
-                            Icons.cleaning_services_outlined,
-                            size: 16,
-                            color: Colors.white54,
-                          ),
-                          onPressed: () => ref
-                              .read(aiCoachProvider.notifier)
-                              .clearChatHistory(),
+                          icon: const Icon(Icons.cleaning_services_outlined, size: 16, color: Colors.white54),
+                          onPressed: () => ref.read(aiCoachProvider.notifier).clearChatHistory(),
                         ),
                       ],
                     ),
                   ],
                 ),
                 const SizedBox(height: 6),
-
                 SingleChildScrollView(
                   scrollDirection: Axis.horizontal,
                   child: Row(
                     children: [
                       ActionChip(
                         visualDensity: VisualDensity.compact,
-                        avatar: const Icon(
-                          Icons.calendar_today,
-                          size: 14,
-                          color: Colors.tealAccent,
-                        ),
-                        label: const Text(
-                          'Plan Next 3 Blocks',
-                          style: TextStyle(fontSize: 11),
-                        ),
+                        avatar: const Icon(Icons.calendar_today, size: 14, color: Colors.tealAccent),
+                        label: const Text('Plan Next 3 Blocks', style: TextStyle(fontSize: 11)),
                         onPressed: aiState.isLoading
                             ? null
                             : () => _sendDoubtOrRequest(
@@ -1818,47 +1748,18 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                       const SizedBox(width: 6),
                       ActionChip(
                         visualDensity: VisualDensity.compact,
-                        avatar: const Icon(
-                          Icons.quiz_outlined,
-                          size: 14,
-                          color: Colors.amberAccent,
-                        ),
-                        label: Text(
-                          'Quiz Me on $_selectedSubject',
-                          style: const TextStyle(fontSize: 11),
-                        ),
+                        avatar: const Icon(Icons.quiz_outlined, size: 14, color: Colors.amberAccent),
+                        label: Text('Quiz Me on $_selectedSubject', style: const TextStyle(fontSize: 11)),
                         onPressed: aiState.isLoading
                             ? null
                             : () => _sendDoubtOrRequest(
                                   'Give me 1 engaging conceptual question or numerical problem in $_selectedSubject based on my latest breadcrumb (${latestSubjectLog?.breadcrumb ?? "core concepts"}) using clean Unicode math.',
                                 ),
                       ),
-                      if (latestSubjectLog != null &&
-                          latestSubjectLog.breadcrumb.isNotEmpty) ...[
-                        const SizedBox(width: 6),
-                        ActionChip(
-                          visualDensity: VisualDensity.compact,
-                          avatar: const Icon(
-                            Icons.lightbulb_outline,
-                            size: 14,
-                            color: Colors.orangeAccent,
-                          ),
-                          label: const Text(
-                            'Resume My Breadcrumb',
-                            style: TextStyle(fontSize: 11),
-                          ),
-                          onPressed: aiState.isLoading
-                              ? null
-                              : () => _sendDoubtOrRequest(
-                                    'My last breadcrumb in $_selectedSubject was "${latestSubjectLog.breadcrumb}". Give me a quick, friendly 3-bullet refresher so I can jump right back in.',
-                                  ),
-                        ),
-                      ],
                     ],
                   ),
                 ),
                 const SizedBox(height: 8),
-
                 Container(
                   height: 215,
                   padding: const EdgeInsets.all(10),
@@ -1869,89 +1770,39 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                   ),
                   child: ListView.builder(
                     controller: _chatScrollCtrl,
-                    itemCount:
-                        aiState.messages.length + (aiState.isLoading ? 1 : 0),
+                    itemCount: aiState.messages.length + (aiState.isLoading ? 1 : 0),
                     itemBuilder: (context, idx) {
                       if (idx == aiState.messages.length) {
                         return const Padding(
                           padding: EdgeInsets.symmetric(vertical: 8.0),
-                          child: Row(
-                            children: [
-                              SizedBox(
-                                width: 14,
-                                height: 14,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                  color: Colors.tealAccent,
-                                ),
-                              ),
-                              SizedBox(width: 8),
-                              Text(
-                                'Groq Mentor is crafting your answer...',
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.tealAccent,
-                                ),
-                              ),
-                            ],
+                          child: Text(
+                            'Groq Mentor is crafting your answer...',
+                            style: TextStyle(fontSize: 12, color: Colors.tealAccent),
                           ),
                         );
                       }
-
                       final msg = aiState.messages[idx];
                       final isUser = msg.role == 'user';
-
                       return Align(
-                        alignment: isUser
-                            ? Alignment.centerRight
-                            : Alignment.centerLeft,
+                        alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
                         child: Container(
                           margin: const EdgeInsets.only(bottom: 10),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 12,
-                            vertical: 10,
-                          ),
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                           constraints: const BoxConstraints(maxWidth: 440),
                           decoration: BoxDecoration(
-                            color: isUser
-                                ? Colors.tealAccent.withValues(alpha: 0.16)
-                                : const Color(0xFF211D35),
+                            color: isUser ? Colors.tealAccent.withValues(alpha: 0.16) : const Color(0xFF211D35),
                             borderRadius: BorderRadius.circular(12),
-                            border: Border.all(
-                              color: isUser
-                                  ? Colors.tealAccent.withValues(alpha: 0.35)
-                                  : Colors.white10,
-                            ),
                           ),
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(
-                                    isUser
-                                        ? Icons.person_outline
-                                        : Icons.school_outlined,
-                                    size: 12,
-                                    color: isUser
-                                        ? Colors.tealAccent
-                                        : Colors.amberAccent,
-                                  ),
-                                  const SizedBox(width: 4),
-                                  Text(
-                                    isUser
-                                        ? 'You • ${msg.subject}'
-                                        : 'Groq Mentor • ${msg.subject}',
-                                    style: TextStyle(
-                                      fontSize: 10.5,
-                                      fontWeight: FontWeight.bold,
-                                      color: isUser
-                                          ? Colors.tealAccent
-                                          : Colors.amberAccent,
-                                    ),
-                                  ),
-                                ],
+                              Text(
+                                isUser ? 'You • ${msg.subject}' : 'Groq Mentor • ${msg.subject}',
+                                style: TextStyle(
+                                  fontSize: 10.5,
+                                  fontWeight: FontWeight.bold,
+                                  color: isUser ? Colors.tealAccent : Colors.amberAccent,
+                                ),
                               ),
                               const SizedBox(height: 5),
                               _buildFormattedMessageText(msg.text),
@@ -1963,7 +1814,6 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                   ),
                 ),
                 const SizedBox(height: 8),
-
                 Row(
                   children: [
                     Expanded(
@@ -1973,29 +1823,17 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                         style: const TextStyle(fontSize: 12.5),
                         decoration: InputDecoration(
                           isDense: true,
-                          contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 14,
-                            vertical: 10,
-                          ),
-                          hintText:
-                              'Ask a $_selectedSubject doubt or custom plan...',
-                          hintStyle: const TextStyle(
-                            fontSize: 12,
-                            color: Colors.white54,
-                          ),
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                          hintText: 'Ask a $_selectedSubject doubt or custom plan...',
                           filled: true,
                           fillColor: Colors.black26,
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(20),
-                            borderSide: const BorderSide(color: Colors.white24),
-                          ),
+                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(20)),
                         ),
                       ),
                     ),
                     const SizedBox(width: 8),
                     IconButton.filled(
-                      onPressed:
-                          aiState.isLoading ? null : () => _sendDoubtOrRequest(),
+                      onPressed: aiState.isLoading ? null : () => _sendDoubtOrRequest(),
                       icon: const Icon(Icons.send_rounded, size: 18),
                     ),
                   ],
@@ -2008,18 +1846,16 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     );
   }
 
-  Widget _buildAnalyticsAndLogsPanel(
-    List<StudyBlockLog> logs, {
-    required bool isDesktop,
-  }) {
-    final totalMins =
-        logs.fold<int>(0, (sum, item) => sum + item.durationMinutes);
-    final avgFatigue = logs.isEmpty
-        ? 0.0
-        : logs.fold<int>(0, (sum, item) => sum + item.fatigueScore) /
-            logs.length;
-    final totalSpills =
-        logs.fold<int>(0, (sum, item) => sum + item.memorySpills);
+  Widget _buildAnalyticsAndLogsPanel(List logs, {required bool isDesktop}) {
+    int totalMins = 0;
+    int totalFatigue = 0;
+    int totalSpills = 0;
+    for (final item in logs) {
+      totalMins += (item.durationMinutes as int);
+      totalFatigue += (item.fatigueScore as int);
+      totalSpills += (item.memorySpills as int);
+    }
+    final avgFatigue = logs.isEmpty ? 0.0 : totalFatigue / logs.length;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -2029,17 +1865,9 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
           children: [
             _buildKpiCard('Total Focus', '${totalMins}m', Icons.timer_outlined),
             const SizedBox(width: 8),
-            _buildKpiCard(
-              'Avg Strain',
-              '${avgFatigue.toStringAsFixed(1)}/5',
-              Icons.speed,
-            ),
+            _buildKpiCard('Avg Strain', '${avgFatigue.toStringAsFixed(1)}/5', Icons.speed),
             const SizedBox(width: 8),
-            _buildKpiCard(
-              'Total Spills',
-              '$totalSpills',
-              Icons.psychology_alt,
-            ),
+            _buildKpiCard('Total Spills', '$totalSpills', Icons.psychology_alt),
           ],
         ),
         const SizedBox(height: 14),
@@ -2047,15 +1875,9 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Expanded(
-                flex: 5,
-                child: _build14DayHeatmap(logs),
-              ),
+              Expanded(flex: 5, child: _build14DayHeatmap(logs)),
               const SizedBox(width: 12),
-              Expanded(
-                flex: 6,
-                child: _buildSubjectBalance(logs, totalMins),
-              ),
+              Expanded(flex: 6, child: _buildSubjectBalance(logs, totalMins)),
             ],
           )
         else ...[
@@ -2065,52 +1887,37 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
         ],
         const SizedBox(height: 14),
         if (logs.isNotEmpty) ...[
-          const Text(
-            'Fatigue Trend (Last 7 Blocks)',
-            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
-          ),
+          const Text('Fatigue Trend (Last 7 Blocks)', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
           const SizedBox(height: 8),
           SizedBox(
             height: 120,
             child: Padding(
               padding: const EdgeInsets.only(right: 8.0),
-              child: _buildFatigueChart(
-                logs.take(7).toList().reversed.toList(),
-              ),
+              child: _buildFatigueChart(logs.take(7).toList().reversed.toList()),
             ),
           ),
           const SizedBox(height: 14),
         ],
-        const Text(
-          'Recent Interleaved Blocks & Breadcrumbs',
-          style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-        ),
+        const Text('Recent Interleaved Blocks & Breadcrumbs', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
         const SizedBox(height: 8),
         if (isDesktop)
-          Expanded(
-            child: _buildLogsList(logs, shrinkWrap: false),
-          )
+          Expanded(child: _buildLogsList(logs, shrinkWrap: false))
         else
           _buildLogsList(logs, shrinkWrap: true),
       ],
     );
   }
 
-  Widget _buildLogsList(List<StudyBlockLog> logs, {required bool shrinkWrap}) {
+  Widget _buildLogsList(List logs, {required bool shrinkWrap}) {
     if (logs.isEmpty) {
       return const Padding(
         padding: EdgeInsets.symmetric(vertical: 24.0),
-        child: Center(
-          child: Text('Complete a study block to see logs & charts.'),
-        ),
+        child: Center(child: Text('Complete a study block to see logs & charts.')),
       );
     }
-
     return ListView.builder(
       shrinkWrap: shrinkWrap,
-      physics: shrinkWrap
-          ? const NeverScrollableScrollPhysics()
-          : const AlwaysScrollableScrollPhysics(),
+      physics: shrinkWrap ? const NeverScrollableScrollPhysics() : const AlwaysScrollableScrollPhysics(),
       itemCount: logs.length,
       itemBuilder: (context, index) {
         final log = logs[index];
@@ -2123,11 +1930,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
               backgroundColor: _getFatigueColor(log.fatigueScore),
               child: Text(
                 '${log.fatigueScore}',
-                style: const TextStyle(
-                  color: Colors.black,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 13,
-                ),
+                style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 13),
               ),
             ),
             title: Text(
@@ -2136,16 +1939,13 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
               style: const TextStyle(fontWeight: FontWeight.w600),
             ),
             subtitle: Text(
-              log.breadcrumb.isEmpty
-                  ? 'No breadcrumb saved'
-                  : 'Next: ${log.breadcrumb}',
+              log.breadcrumb.isEmpty ? 'No breadcrumb saved' : 'Next: ${log.breadcrumb}',
               maxLines: 2,
               overflow: TextOverflow.ellipsis,
             ),
             trailing: IconButton(
               icon: const Icon(Icons.delete_outline, size: 18),
-              onPressed: () =>
-                  ref.read(studyLogsProvider.notifier).deleteLog(log.id),
+              onPressed: () => ref.read(studyLogsProvider.notifier).deleteLog(log.id),
             ),
           ),
         );
@@ -2153,45 +1953,37 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     );
   }
 
-  Widget _build14DayHeatmap(List<StudyBlockLog> logs) {
+  Widget _build14DayHeatmap(List logs) {
     final now = DateTime.now();
-    final days = List.generate(14, (i) {
+    final days = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13].map((i) {
       final d = now.subtract(Duration(days: 13 - i));
       return DateTime(d.year, d.month, d.day);
-    });
+    }).toList();
 
-    final Map<DateTime, int> dailyMinutes = {};
+    final dailyMinutes = {};
     for (final log in logs) {
-      final key = DateTime(
-        log.timestamp.year,
-        log.timestamp.month,
-        log.timestamp.day,
-      );
-      dailyMinutes[key] = (dailyMinutes[key] ?? 0) + log.durationMinutes;
+      final key = DateTime(log.timestamp.year, log.timestamp.month, log.timestamp.day);
+      dailyMinutes[key] = ((dailyMinutes[key] ?? 0) as int) + (log.durationMinutes as int);
     }
-
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(12.0),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
-              '14-Day Consistency',
-              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-            ),
+            const Text('14-Day Consistency', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
             const SizedBox(height: 8),
             Wrap(
               spacing: 6,
               runSpacing: 6,
               children: days.map((day) {
-                final mins = dailyMinutes[day] ?? 0;
+                final int mins = (dailyMinutes[day] ?? 0) as int;
                 Color boxColor = Colors.white10;
                 if (mins >= 180) {
                   boxColor = Colors.tealAccent;
                 } else if (mins >= 90) {
                   boxColor = Colors.tealAccent.withValues(alpha: 0.6);
-                } else if (mins > 0) {
+                } else if (mins >= 1) {
                   boxColor = Colors.tealAccent.withValues(alpha: 0.3);
                 }
                 return Tooltip(
@@ -2199,10 +1991,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                   child: Container(
                     width: 22,
                     height: 22,
-                    decoration: BoxDecoration(
-                      color: boxColor,
-                      borderRadius: BorderRadius.circular(4),
-                    ),
+                    decoration: BoxDecoration(color: boxColor, borderRadius: BorderRadius.circular(4)),
                   ),
                 );
               }).toList(),
@@ -2213,15 +2002,13 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     );
   }
 
-  Widget _buildSubjectBalance(List<StudyBlockLog> logs, int totalMins) {
-    final Map<String, int> subjectMins = {};
+  Widget _buildSubjectBalance(List logs, int totalMins) {
+    final subjectMins = {};
     for (final log in logs) {
-      subjectMins[log.subject] =
-          (subjectMins[log.subject] ?? 0) + log.durationMinutes;
+      subjectMins[log.subject] = ((subjectMins[log.subject] ?? 0) as int) + (log.durationMinutes as int);
     }
-
     final entries = subjectMins.entries.toList()
-      ..sort((a, b) => b.value.compareTo(a.value));
+      ..sort((a, b) => (b.value as int).compareTo(a.value as int));
 
     return Card(
       child: Padding(
@@ -2229,20 +2016,14 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
-              'Subject Balance',
-              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-            ),
+            const Text('Subject Balance', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
             const SizedBox(height: 8),
             if (entries.isEmpty)
-              const Text(
-                'No data yet',
-                style: TextStyle(fontSize: 11, color: Colors.white54),
-              )
+              const Text('No data yet', style: TextStyle(fontSize: 11, color: Colors.white54))
             else
               ...entries.take(4).map((e) {
-                final ratio =
-                    (totalMins > 0 ? e.value / totalMins : 0.0).clamp(0.0, 1.0);
+                final int val = e.value as int;
+                final double ratio = totalMins >= 1 ? (val / totalMins) : 0.0;
                 return Padding(
                   padding: const EdgeInsets.only(bottom: 6.0),
                   child: Column(
@@ -2251,30 +2032,18 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                       Row(
                         children: [
                           Expanded(
-                            child: Text(
-                              e.key,
-                              overflow: TextOverflow.ellipsis,
-                              maxLines: 1,
-                              style: const TextStyle(fontSize: 11),
-                            ),
+                            child: Text(e.key.toString(), overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 11)),
                           ),
-                          const SizedBox(width: 8),
                           Text(
-                            '${(ratio * 100).toInt()}% (${e.value}m)',
-                            style: const TextStyle(
-                              fontSize: 10,
-                              color: Colors.white70,
-                            ),
+                            '${(ratio * 100).toInt()}% (${val}m)',
+                            style: const TextStyle(fontSize: 10, color: Colors.white70),
                           ),
                         ],
                       ),
                       const SizedBox(height: 3),
                       ClipRRect(
                         borderRadius: BorderRadius.circular(4),
-                        child: LinearProgressIndicator(
-                          value: ratio,
-                          minHeight: 6,
-                        ),
+                        child: LinearProgressIndicator(value: ratio, minHeight: 6),
                       ),
                     ],
                   ),
@@ -2297,19 +2066,9 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
               const SizedBox(height: 4),
               FittedBox(
                 fit: BoxFit.scaleDown,
-                child: Text(
-                  value,
-                  style: const TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
+                child: Text(value, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
               ),
-              Text(
-                label,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(fontSize: 11, color: Colors.white70),
-              ),
+              Text(label, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 11, color: Colors.white70)),
             ],
           ),
         ),
@@ -2317,7 +2076,8 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     );
   }
 
-  Widget _buildFatigueChart(List<StudyBlockLog> recentLogs) {
+  Widget _buildFatigueChart(List recentLogs) {
+    final indices = List.generate(recentLogs.length, (i) => i);
     return BarChart(
       BarChartData(
         alignment: BarChartAlignment.spaceAround,
@@ -2326,19 +2086,14 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
         gridData: const FlGridData(show: true, drawVerticalLine: false),
         borderData: FlBorderData(show: false),
         titlesData: FlTitlesData(
-          topTitles:
-              const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-          rightTitles:
-              const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+          topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+          rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
           leftTitles: AxisTitles(
             sideTitles: SideTitles(
               showTitles: true,
               reservedSize: 22,
               interval: 1,
-              getTitlesWidget: (val, _) => Text(
-                '${val.toInt()}',
-                style: const TextStyle(fontSize: 10),
-              ),
+              getTitlesWidget: (val, _) => Text('${val.toInt()}', style: const TextStyle(fontSize: 10)),
             ),
           ),
           bottomTitles: AxisTitles(
@@ -2347,34 +2102,30 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
               reservedSize: 22,
               getTitlesWidget: (val, _) {
                 final idx = val.toInt();
-                if (idx < 0 || idx >= recentLogs.length) {
-                  return const SizedBox();
-                }
-                final shortName = recentLogs[idx].subject.length > 4
-                    ? recentLogs[idx].subject.substring(0, 4)
-                    : recentLogs[idx].subject;
+                if (idx <= -1 || idx >= recentLogs.length) return const SizedBox();
+                final String s = recentLogs[idx].subject.toString();
                 return Padding(
                   padding: const EdgeInsets.only(top: 4.0),
-                  child: Text(shortName, style: const TextStyle(fontSize: 10)),
+                  child: Text(s.length >= 5 ? s.substring(0, 4) : s, style: const TextStyle(fontSize: 10)),
                 );
               },
             ),
           ),
         ),
-        barGroups: List.generate(recentLogs.length, (index) {
-          final log = recentLogs[index];
+        barGroups: indices.map((i) {
+          final log = recentLogs[i];
           return BarChartGroupData(
-            x: index,
+            x: i,
             barRods: [
               BarChartRodData(
-                toY: log.fatigueScore.toDouble(),
-                color: _getFatigueColor(log.fatigueScore),
+                toY: (log.fatigueScore as int).toDouble(),
+                color: _getFatigueColor(log.fatigueScore as int),
                 width: 14,
                 borderRadius: BorderRadius.circular(4),
               ),
             ],
           );
-        }),
+        }).toList(),
       ),
     );
   }
@@ -2401,70 +2152,74 @@ class LogBottomSheet extends ConsumerStatefulWidget {
   });
 
   @override
-  ConsumerState<LogBottomSheet> createState() => _LogBottomSheetState();
+  ConsumerState createState() => _LogBottomSheetState();
 }
 
-class _LogBottomSheetState extends ConsumerState<LogBottomSheet> {
+class _LogBottomSheetState extends ConsumerState {
   double _fatigue = 3;
   final TextEditingController _breadcrumbCtrl = TextEditingController();
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: EdgeInsets.only(
-        left: 20,
-        right: 20,
-        top: 20,
-        bottom: MediaQuery.of(context).viewInsets.bottom + 20,
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            'Log ${widget.subject} (${widget.durationMinutes}m • ${widget.memorySpills} spills)',
-            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 16),
-          Text('Cognitive Fatigue Score: ${_fatigue.toInt()} / 5'),
-          Slider(
-            value: _fatigue,
-            min: 1,
-            max: 5,
-            divisions: 4,
-            label: '${_fatigue.toInt()}',
-            onChanged: (val) => setState(() => _fatigue = val),
-          ),
-          TextField(
-            controller: _breadcrumbCtrl,
-            decoration: const InputDecoration(
-              labelText: '5-Word Breadcrumb (Where to pick up next?)',
-              hintText: 'e.g., Completed Q14, start integration by parts',
-              border: OutlineInputBorder(),
+    final w = widget as LogBottomSheet;
+    final mediaQuery = MediaQuery.of(context);
+    final bottomInset = mediaQuery.viewInsets.bottom + mediaQuery.viewPadding.bottom + 24;
+
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: EdgeInsets.only(
+          left: 20,
+          right: 20,
+          top: 20,
+          bottom: bottomInset,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Log ${w.subject} (${w.durationMinutes}m • ${w.memorySpills} spills)',
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
             ),
-          ),
-          const SizedBox(height: 16),
-          FilledButton(
-            onPressed: () async {
-              final log = StudyBlockLog(
-                id: DateTime.now().millisecondsSinceEpoch.toString(),
-                subject: widget.subject,
-                timestamp: DateTime.now(),
-                durationMinutes: widget.durationMinutes,
-                fatigueScore: _fatigue.toInt(),
-                memorySpills: widget.memorySpills,
-                breadcrumb: _breadcrumbCtrl.text.trim(),
-              );
-              await ref.read(studyLogsProvider.notifier).addLog(log);
-              final nextBreak = ref.read(recommendedBreakProvider);
-              widget.onSaved(nextBreak);
-              if (context.mounted) Navigator.pop(context);
-            },
-            child: const Center(
-              child: Text('Save Log & Start Recovery Break'),
+            const SizedBox(height: 16),
+            Text('Cognitive Fatigue Score: ${_fatigue.toInt()} / 5'),
+            Slider(
+              value: _fatigue,
+              min: 1,
+              max: 5,
+              divisions: 4,
+              label: '${_fatigue.toInt()}',
+              onChanged: (val) => setState(() => _fatigue = val),
             ),
-          ),
-        ],
+            TextField(
+              controller: _breadcrumbCtrl,
+              decoration: const InputDecoration(
+                labelText: '5-Word Breadcrumb (Where to pick up next?)',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 16),
+            FilledButton(
+              onPressed: () async {
+                final log = StudyBlockLog(
+                  id: DateTime.now().millisecondsSinceEpoch.toString(),
+                  subject: w.subject,
+                  timestamp: DateTime.now(),
+                  durationMinutes: w.durationMinutes,
+                  fatigueScore: _fatigue.toInt(),
+                  memorySpills: w.memorySpills,
+                  breadcrumb: _breadcrumbCtrl.text.trim(),
+                );
+                await ref.read(studyLogsProvider.notifier).addLog(log);
+                final nextBreak = ref.read(recommendedBreakProvider);
+                w.onSaved(nextBreak);
+                if (context.mounted) Navigator.pop(context);
+              },
+              child: const Center(child: Text('Save Log & Start Recovery Break')),
+            ),
+          ],
+        ),
       ),
     );
   }
