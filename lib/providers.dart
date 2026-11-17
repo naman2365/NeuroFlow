@@ -367,11 +367,31 @@ class AiCoachNotifier extends StateNotifier<AiCoachState> {
 
     try {
       final logs = ref.read(studyLogsProvider);
+
+      String _sanitizeForExternal(String input) {
+        final noEmails = input.replaceAll(
+          RegExp(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'),
+          '[redacted-email]',
+        );
+        final noUrls = noEmails.replaceAll(
+          RegExp(r'https?:\/\/\S+'),
+          '[redacted-url]',
+        );
+        final noLongNumbers = noUrls.replaceAll(
+          RegExp(r'\b\d{5,}\b'),
+          '[redacted-number]',
+        );
+        final compact = noLongNumbers.replaceAll(RegExp(r'\s+'), ' ').trim();
+        return compact.length > 300 ? '${compact.substring(0, 300)}…' : compact;
+      }
+
       final recentSummary = logs
           .take(5)
           .map((l) =>
-              '${l.subject} (${l.durationMinutes}m, fatigue ${l.fatigueScore}/5, spills ${l.memorySpills}, breadcrumb: "${l.breadcrumb}")')
+              '${l.subject} (${l.durationMinutes}m, fatigue ${l.fatigueScore}/5, spills ${l.memorySpills})')
           .join('; ');
+      final safeProfileGoal = _sanitizeForExternal(state.userProfileGoal);
+      final safeUserMessage = _sanitizeForExternal(userMessage);
 
       String replyText = '';
 
@@ -389,9 +409,9 @@ class AiCoachNotifier extends StateNotifier<AiCoachState> {
                   {
                     'role': 'system',
                     'content':
-                        'You are NeuroFlow Groq Mentor. Student profile: ${state.userProfileGoal}. Current subject: $currentSubject. Recent study blocks: $recentSummary. Use clean Unicode math and concise bullet points.',
+                        'You are NeuroFlow Groq Mentor. Student profile: $safeProfileGoal. Current subject: $currentSubject. Recent study blocks: $recentSummary. Use clean Unicode math and concise bullet points.',
                   },
-                  {'role': 'user', 'content': userMessage},
+                  {'role': 'user', 'content': safeUserMessage},
                 ],
                 'temperature': 0.6,
               }),
