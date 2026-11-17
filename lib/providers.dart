@@ -139,10 +139,14 @@ class StudyLogsNotifier extends StateNotifier<List<StudyBlockLog>> {
     ref.read(syncStatusProvider.notifier).state = 'Syncing...';
 
     try {
-      final uri = Uri.parse(
-        '$kDefaultCloudflareWorkerUrl/sync?id=${Uri.encodeComponent(syncId)}&pin=${Uri.encodeComponent(syncPin)}',
-      );
-      final resp = await http.get(uri).timeout(const Duration(seconds: 8));
+      final uri = Uri.parse('$kDefaultCloudflareWorkerUrl/sync');
+      final resp = await http
+          .post(
+            uri,
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'id': syncId, 'pin': syncPin}),
+          )
+          .timeout(const Duration(seconds: 8));
       if (resp.statusCode == 200) {
         final data = jsonDecode(resp.body);
         if (data is Map && data['logs'] is Iterable) {
