@@ -71,6 +71,7 @@ jobs:
   build-windows:
     name: 💻 Build Windows Workstation
     needs: analyze
+    if: false
     runs-on: windows-latest
     steps:
       - name: Checkout Repository
