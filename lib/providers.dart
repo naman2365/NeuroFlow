@@ -27,7 +27,7 @@ class StudyLogNotifier extends StateNotifier<List<StudyBlockLog>> {
   final Ref ref;
   StudyLogNotifier(this.ref) : super([]) {
     _loadLocalLogs();
-    _initCloudSyncIfConfigured();
+    Future(_initCloudSyncIfConfigured);
   }
 
   final Box _box = Hive.box('study_logs_box');
@@ -197,7 +197,7 @@ final subjectsProvider =
 
 class SubjectsNotifier extends StateNotifier<List<String>> {
   SubjectsNotifier()
-      : super(['Physics', 'Mathematics', 'Chemistry', 'Python / AI']) {
+      : super(['Physics', 'Mathematics', 'Chemistry', 'Biology', 'Python / AI']) {
     _loadSubjects();
   }
 
