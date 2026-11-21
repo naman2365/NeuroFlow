@@ -1,6 +1,7 @@
 ﻿import 'dart:async';
-import 'dart:convert';
-import 'dart:io' show Platform, Process, ProcessSignal;
+import 'dart:ffi' hide Size;
+import 'dart:io' show Platform;
+import 'dart:ui' show ImageFilter;
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -8,8 +9,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'package:window_manager/legacy.dart';
+import 'package:window_manager/window_manager.dart';
 import 'package:audioplayers/audioplayers.dart';
+import 'package:media_kit/media_kit.dart' as mk;
 import 'package:file_selector/file_selector.dart';
 import 'models.dart';
 import 'providers.dart';
@@ -19,15 +21,136 @@ bool get isDesktopPlatform =>
 
 bool get isWindowsNative => !kIsWeb && Platform.isWindows;
 
+// Pure dart:ffi Win32 active window title & Windows 11 DWM Fluent helper (Zero extra packages)
+typedef _GetForegroundWindowNative = IntPtr Function();
+typedef _GetForegroundWindowDart = int Function();
+typedef _GetActiveWindowNative = IntPtr Function();
+typedef _GetActiveWindowDart = int Function();
+typedef _GetWindowTextWNative = Int32 Function(
+    IntPtr hWnd, Pointer<Uint16> lpString, Int32 nMaxCount);
+typedef _GetWindowTextWDart = int Function(
+    int hWnd, Pointer<Uint16> lpString, int nMaxCount);
+typedef _LocalAllocNative = Pointer<Uint16> Function(
+    Uint32 uFlags, IntPtr uBytes);
+typedef _LocalAllocDart = Pointer<Uint16> Function(int uFlags, int uBytes);
+typedef _LocalFreeNative = Pointer<Void> Function(Pointer<Uint16> hMem);
+typedef _LocalFreeDart = Pointer<Void> Function(Pointer<Uint16> hMem);
+typedef _DwmSetWindowAttributeNative = Int32 Function(
+    IntPtr hwnd, Uint32 dwAttribute, Pointer<Void> pvAttribute, Uint32 cbAttribute);
+typedef _DwmSetWindowAttributeDart = int Function(
+    int hwnd, int dwAttribute, Pointer<Void> pvAttribute, int cbAttribute);
+
+class _Win32WindowHelper {
+  static bool _initialized = false;
+  static _GetForegroundWindowDart? _getForegroundWindow;
+  static _GetActiveWindowDart? _getActiveWindow;
+  static _GetWindowTextWDart? _getWindowTextW;
+  static _LocalAllocDart? _localAlloc;
+  static _LocalFreeDart? _localFree;
+  static _DwmSetWindowAttributeDart? _dwmSetWindowAttribute;
+
+  static void _init() {
+    if (_initialized || !isWindowsNative) return;
+    try {
+      final user32 = DynamicLibrary.open('user32.dll');
+      final kernel32 = DynamicLibrary.open('kernel32.dll');
+      _getForegroundWindow = user32
+          .lookupFunction<_GetForegroundWindowNative, _GetForegroundWindowDart>(
+              'GetForegroundWindow');
+      _getActiveWindow = user32
+          .lookupFunction<_GetActiveWindowNative, _GetActiveWindowDart>(
+              'GetActiveWindow');
+      _getWindowTextW = user32
+          .lookupFunction<_GetWindowTextWNative, _GetWindowTextWDart>(
+              'GetWindowTextW');
+      _localAlloc = kernel32
+          .lookupFunction<_LocalAllocNative, _LocalAllocDart>('LocalAlloc');
+      _localFree = kernel32
+          .lookupFunction<_LocalFreeNative, _LocalFreeDart>('LocalFree');
+      try {
+        final dwmapi = DynamicLibrary.open('dwmapi.dll');
+        _dwmSetWindowAttribute = dwmapi.lookupFunction<
+            _DwmSetWindowAttributeNative,
+            _DwmSetWindowAttributeDart>('DwmSetWindowAttribute');
+      } catch (_) {}
+      _initialized = true;
+    } catch (e) {
+      debugPrint('[WIN32_FFI ERR] $e');
+    }
+  }
+
+  static void applyWindows11Style({required bool isHud}) {
+    if (!isWindowsNative) return;
+    _init();
+    if (!_initialized ||
+        _dwmSetWindowAttribute == null ||
+        _localAlloc == null ||
+        _localFree == null) {
+      return;
+    }
+    int hwnd = _getActiveWindow?.call() ?? 0;
+    if (hwnd == 0) hwnd = _getForegroundWindow?.call() ?? 0;
+    if (hwnd == 0) return;
+
+    final buf = _localAlloc!(0x0040, 4);
+    if (buf == nullptr) return;
+    try {
+      final intPtr = buf.cast<Int32>();
+      // 20 = DWMWA_USE_IMMERSIVE_DARK_MODE (1 = dark)
+      intPtr.value = 1;
+      _dwmSetWindowAttribute!(hwnd, 20, buf.cast<Void>(), 4);
+      // 33 = DWMWA_WINDOW_CORNER_PREFERENCE (2 = DWMWCP_ROUND)
+      intPtr.value = 2;
+      _dwmSetWindowAttribute!(hwnd, 33, buf.cast<Void>(), 4);
+      // 38 = DWMWA_SYSTEMBACKDROP_TYPE (3 = Acrylic for HUD, 2 = Mica for main)
+      intPtr.value = isHud ? 3 : 2;
+      _dwmSetWindowAttribute!(hwnd, 38, buf.cast<Void>(), 4);
+    } catch (_) {
+    } finally {
+      _localFree!(buf);
+    }
+  }
+
+  static String getActiveWindowTitle() {
+    if (!isWindowsNative) return '';
+    _init();
+    if (!_initialized ||
+        _getForegroundWindow == null ||
+        _getWindowTextW == null ||
+        _localAlloc == null ||
+        _localFree == null) {
+      return '';
+    }
+    final hwnd = _getForegroundWindow!();
+    if (hwnd == 0) return '';
+
+    const int maxChars = 512;
+    // 0x0040 = LPTR (LMEM_FIXED | LMEM_ZEROINIT)
+    final buffer = _localAlloc!(0x0040, maxChars * 2);
+    if (buffer == nullptr) return '';
+    try {
+      final len = _getWindowTextW!(hwnd, buffer, maxChars);
+      if (len <= 0) return '';
+      return String.fromCharCodes(buffer.asTypedList(len));
+    } catch (_) {
+      return '';
+    } finally {
+      _localFree!(buffer);
+    }
+  }
+}
+
 void main() {
   runZonedGuarded(() async {
     WidgetsFlutterBinding.ensureInitialized();
+    if (isWindowsNative) {
+      mk.MediaKit.ensureInitialized();
+    }
     await Hive.initFlutter();
     await Hive.openBox('study_logs_box');
     await Hive.openBox('settings_box');
 
     if (isDesktopPlatform) {
-      // ignore: deprecated_member_use
       await windowManager.ensureInitialized();
       const windowOptions = WindowOptions(
         size: Size(1180, 840),
@@ -41,6 +164,7 @@ void main() {
       await windowManager.waitUntilReadyToShow(windowOptions, () async {
         await windowManager.show();
         await windowManager.focus();
+        _Win32WindowHelper.applyWindows11Style(isHud: false);
       });
     }
 
@@ -55,16 +179,19 @@ class FocusTrackerApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'NeuroFlow — Cognitive Interleaver',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark(useMaterial3: true).copyWith(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: Colors.tealAccent,
-          brightness: Brightness.dark,
+    return ExcludeSemantics(
+      excluding: isWindowsNative,
+      child: MaterialApp(
+        title: 'NeuroFlow — Cognitive Interleaver',
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData.dark(useMaterial3: true).copyWith(
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: Colors.tealAccent,
+            brightness: Brightness.dark,
+          ),
         ),
+        home: const DashboardScreen(),
       ),
-      home: const DashboardScreen(),
     );
   }
 }
@@ -76,7 +203,7 @@ class DashboardScreen extends ConsumerStatefulWidget {
   ConsumerState createState() => _DashboardScreenState();
 }
 
-class _DashboardScreenState extends ConsumerState {
+class _DashboardScreenState extends ConsumerState with WindowListener {
   String _selectedSubject = 'Physics';
   Timer? _timer;
   int _secondsRemaining = 75 * 60;
@@ -86,15 +213,116 @@ class _DashboardScreenState extends ConsumerState {
   bool _isBreakMode = false;
   bool _isMiniHud = false;
 
+  // v1.2 Strict Focus Shield state (30s grace, continuous tracking in Mini-HUD, smart study whitelist)
+  bool _isStrictMode = false;
+  Timer? _graceTimer;
+  int _graceSecondsLeft = 0;
+  bool _isStudySiteAllowed = false;
+  bool _pendingShieldAlert = false;
+  String _lastBlockedWindowTitle = '';
+
+  static const _defaultStudyKeywords = [
+    'neuroflow',
+    'physics wallah',
+    'pw.live',
+    'khan academy',
+    'unacademy',
+    'allen',
+    'vedantu',
+    'ncert',
+    'coursera',
+    'udemy',
+    'edx',
+    'wikipedia',
+    'desmos',
+    'wolfram',
+    'brilliant',
+    'geeksforgeeks',
+    'leetcode',
+    'stackoverflow',
+    'github',
+    'visual studio code',
+    'android studio',
+    'google colab',
+    'jupyter',
+    'notion',
+    'obsidian',
+    'onenote',
+    'anki',
+    '.pdf',
+    'docs.google',
+    'google docs',
+  ];
+
+  static const _ytStudyKeywords = [
+    'lecture',
+    'jee',
+    'neet',
+    'sat',
+    'cbse',
+    'icse',
+    'ncert',
+    'class 11',
+    'class 12',
+    'one shot',
+    'oneshot',
+    'revision',
+    'concept',
+    'pyq',
+    'numerical',
+    'derivation',
+    'theorem',
+    'formula',
+    'tutorial',
+    'course',
+    'crash course',
+    'explained',
+    'study',
+    'exam',
+    'chapter',
+    'syllabus',
+    'problem',
+    'solution',
+    'physics wallah',
+    'khan academy',
+    '3blue1brown',
+    'organic chemistry tutor',
+    'coding',
+    'programming',
+    'flutter',
+    'python',
+  ];
+
+  static const _ytDistractionKeywords = [
+    'shorts',
+    'gaming',
+    'gameplay',
+    'trailer',
+    'vlog',
+    'prank',
+    'meme',
+    'roast',
+    'standup',
+    'music video',
+    'bgmi',
+    'gta',
+    'minecraft',
+    'movie',
+    'episode',
+    'highlights',
+    'reacts',
+  ];
+
+  var _customStudyKeywords = [];
+
   final TextEditingController _doubtCtrl = TextEditingController();
   final ScrollController _chatScrollCtrl = ScrollController();
 
-  // For Web & Android only (Never initialized on Windows so flutter_windows.dll never crashes!)
+  // For Web & Android only (Never initialized on Windows so audioplayers never crashes)
   AudioPlayer? _mobileWebPlayer;
 
-  // For Windows: Isolated OS Background Process (Zero C++ DLL threads inside Flutter!)
-  Process? _winAudioProcess;
-  StreamSubscription? _winStdoutSub;
+  // For Windows: Native libmpv engine via Dart FFI
+  mk.Player? _winPlayer;
 
   bool _isMusicPlaying = false;
   bool _isMusicLoading = false;
@@ -124,6 +352,9 @@ class _DashboardScreenState extends ConsumerState {
   @override
   void initState() {
     super.initState();
+    if (isDesktopPlatform) {
+      windowManager.addListener(this);
+    }
     final settingsBox = Hive.box('settings_box');
     final savedQueue = settingsBox.get('local_audio_queue');
     if (savedQueue is Iterable) {
@@ -137,90 +368,41 @@ class _DashboardScreenState extends ConsumerState {
         }
       }
     }
+    final savedKeywords = settingsBox.get('allowed_study_keywords');
+    if (savedKeywords is Iterable) {
+      _customStudyKeywords = savedKeywords
+          .map((e) => e.toString().trim().toLowerCase())
+          .where((e) => e.isNotEmpty)
+          .toList();
+    }
   }
 
-  /// Launches a single hidden Windows PresentationCore audio process that communicates via stdin/stdout.
-  /// Because it runs outside focus_fatigue_tracker.exe, it can NEVER crash flutter_windows.dll!
-  Future _ensureWindowsAudioBridge() async {
-    if (_winAudioProcess != null) return;
-
-    const psScript = r'''
-Add-Type -AssemblyName PresentationCore
-$player = New-Object System.Windows.Media.MediaPlayer
-while ($true) {
-  $line = [Console]::In.ReadLine()
-  if ($null -eq $line) { break }
-  $parts = $line.Split('|', 2)
-  $cmd = $parts[0]
-  $arg = if ($parts.Length -gt 1) { $parts[1] } else { "" }
-  try {
-    if ($cmd -eq "OPEN") {
-      $player.Open([Uri]$arg)
-      $player.Play()
-      Write-Output "STATE|PLAYING"
-    } elseif ($cmd -eq "PAUSE") {
-      $player.Pause()
-      Write-Output "STATE|PAUSED"
-    } elseif ($cmd -eq "RESUME") {
-      $player.Play()
-      Write-Output "STATE|PLAYING"
-    } elseif ($cmd -eq "STOP") {
-      $player.Stop()
-      Write-Output "STATE|STOPPED"
-    } elseif ($cmd -eq "VOL") {
-      $player.Volume = [double]$arg
-    } elseif ($cmd -eq "SEEK") {
-      $player.Position = [TimeSpan]::FromSeconds([int]$arg)
-    } elseif ($cmd -eq "POLL") {
-      $pos = [int]$player.Position.TotalSeconds
-      $dur = if ($player.NaturalDuration.HasTimeSpan) { [int]$player.NaturalDuration.TimeSpan.TotalSeconds } else { 0 }
-      Write-Output "TIME|$pos|$dur"
-    }
-  } catch {}
-}
-''';
-
-    final proc = await Process.start(
-      'powershell',
-      ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', psScript],
-    );
-    _winAudioProcess = proc;
-
-    _winStdoutSub = proc.stdout.transform(utf8.decoder).transform(const LineSplitter()).listen((line) {
-      if (!mounted) return;
-      if (line.startsWith('TIME|')) {
-        final parts = line.split('|');
-        if (parts.length >= 3) {
-          final pos = int.tryParse(parts[1]) ?? 0;
-          final dur = int.tryParse(parts[2]) ?? 0;
-          if (!_isSeeking) {
-            setState(() {
-              _audioPosition = Duration(seconds: pos);
-              if (dur >= 1) _audioDuration = Duration(seconds: dur);
-            });
-          }
-          if (dur >= 5 && pos >= dur - 1 && !_isLiveRadioStream) {
-            if (_isLoopOne) {
-              _playCurrentSelection();
-            } else {
-              _skipTrack(1);
-            }
-          }
-        }
+  mk.Player _ensureWindowsPlayer() {
+    if (_winPlayer != null) return _winPlayer!;
+    final p = mk.Player();
+    p.stream.error.listen((err) {
+      debugPrint('[WIN_AUDIO ERR] $err');
+    });
+    p.stream.duration.listen((d) {
+      if (mounted && d.inSeconds >= 1) {
+        setState(() => _audioDuration = d);
       }
     });
-
-    Timer.periodic(const Duration(seconds: 1), (t) {
-      if (!mounted || _winAudioProcess == null) {
-        t.cancel();
-        return;
-      }
-      if (_isMusicPlaying && !_isSeeking) {
-        try {
-          _winAudioProcess!.stdin.writeln('POLL|');
-        } catch (_) {}
+    p.stream.position.listen((pos) {
+      if (mounted && !_isSeeking && pos.inSeconds != _audioPosition.inSeconds) {
+        setState(() => _audioPosition = pos);
       }
     });
+    p.stream.completed.listen((done) {
+      if (!mounted || !done || _isLiveRadioStream) return;
+      if (_isLoopOne) {
+        _playCurrentSelection();
+      } else {
+        _skipTrack(1);
+      }
+    });
+    _winPlayer = p;
+    return p;
   }
 
   AudioPlayer _ensureWebOrAndroidPlayer() {
@@ -247,6 +429,185 @@ while ($true) {
   }
 
   bool get _isLiveRadioStream => _selectedStation == '24/7 Live Lofi Radio';
+
+  bool get _isShieldActive =>
+      isDesktopPlatform &&
+      _isStrictMode &&
+      _isRunning &&
+      !_isBreakMode;
+
+  bool _isAllowedStudyWindow(String rawTitle) {
+    final title = rawTitle.trim().toLowerCase();
+    if (title.isEmpty) return false;
+
+    for (final kw in _customStudyKeywords) {
+      final k = kw.toString().toLowerCase();
+      if (k.isNotEmpty && title.contains(k)) return true;
+    }
+
+    if (title.contains('youtube')) {
+      for (final bad in _ytDistractionKeywords) {
+        if (title.contains(bad)) return false;
+      }
+      final subj = _selectedSubject.toLowerCase();
+      if (subj.length >= 3 && title.contains(subj)) return true;
+      if (subj.contains('math') && title.contains('math')) return true;
+      if (subj.contains('phys') && title.contains('phys')) return true;
+      if (subj.contains('chem') && title.contains('chem')) return true;
+      if (subj.contains('bio') && title.contains('bio')) return true;
+      for (final good in _ytStudyKeywords) {
+        if (title.contains(good)) return true;
+      }
+      return false;
+    }
+
+    for (final kw in _defaultStudyKeywords) {
+      if (title.contains(kw)) return true;
+    }
+    return false;
+  }
+
+  void _startFocusGraceBuffer() {
+    if (!_isShieldActive) return;
+    _graceTimer?.cancel();
+    setState(() {
+      _graceSecondsLeft = 30;
+      _isStudySiteAllowed = false;
+    });
+
+    _graceTimer = Timer.periodic(const Duration(seconds: 1), (t) {
+      if (!mounted || !_isShieldActive) {
+        t.cancel();
+        if (mounted) {
+          setState(() {
+            _graceSecondsLeft = 0;
+            _isStudySiteAllowed = false;
+          });
+        }
+        return;
+      }
+
+      if (isWindowsNative) {
+        final activeTitle = _Win32WindowHelper.getActiveWindowTitle();
+        if (_isAllowedStudyWindow(activeTitle)) {
+          if (!_isStudySiteAllowed || _graceSecondsLeft != 30) {
+            setState(() {
+              _isStudySiteAllowed = true;
+              _graceSecondsLeft = 30;
+            });
+          }
+          return;
+        }
+        _lastBlockedWindowTitle = activeTitle;
+      }
+
+      if (_graceSecondsLeft <= 1) {
+        SystemSound.play(SystemSoundType.alert);
+        setState(() {
+          _isStudySiteAllowed = false;
+          _currentSpills++;
+          _pendingShieldAlert = true;
+          _graceSecondsLeft = 30;
+        });
+      } else {
+        setState(() {
+          _isStudySiteAllowed = false;
+          _graceSecondsLeft--;
+        });
+      }
+    });
+  }
+
+  void _cancelFocusGraceBuffer() {
+    _graceTimer?.cancel();
+    if (mounted && (_graceSecondsLeft != 0 || _isStudySiteAllowed)) {
+      setState(() {
+        _graceSecondsLeft = 0;
+        _isStudySiteAllowed = false;
+      });
+    }
+    if (mounted && _pendingShieldAlert) {
+      _pendingShieldAlert = false;
+      HapticFeedback.heavyImpact();
+      final shortTitle = _lastBlockedWindowTitle.length > 36
+          ? '${_lastBlockedWindowTitle.substring(0, 36)}...'
+          : _lastBlockedWindowTitle;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: Colors.deepOrange.shade800,
+          content: Text(
+            shortTitle.isEmpty
+                ? 'Strict Focus Shield: Left for >30s. Logged +1 Memory Spill (Total: $_currentSpills).'
+                : 'Strict Focus Shield: "$shortTitle" >30s. Logged +1 Spill (Total: $_currentSpills).',
+          ),
+        ),
+      );
+    }
+  }
+
+  @override
+  void onWindowBlur() => _startFocusGraceBuffer();
+
+  @override
+  void onWindowMinimize() => _startFocusGraceBuffer();
+
+  @override
+  void onWindowFocus() => _cancelFocusGraceBuffer();
+
+  void _showWhitelistDialog() {
+    final ctrl = TextEditingController(text: _customStudyKeywords.join(', '));
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.shield_outlined, color: Colors.tealAccent),
+            SizedBox(width: 8),
+            Expanded(child: Text('Allowed Study Sites & Apps')),
+          ],
+        ),
+        content: SizedBox(
+          width: 440,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Built-in whitelist automatically allows Physics Wallah, Khan Academy, NCERT, GitHub, VS Code, PDFs, and study/subject YouTube lectures (Shorts & gaming are blocked).',
+                style: TextStyle(fontSize: 12, color: Colors.white70),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: ctrl,
+                maxLines: 3,
+                decoration: const InputDecoration(
+                  labelText: 'Custom Allowed Keywords (comma-separated)',
+                  hintText: 'e.g., pace, toppr, doubtnut, overleaf, coursera',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () async {
+              final parsed = ctrl.text
+                  .split(',')
+                  .map((e) => e.trim().toLowerCase())
+                  .where((e) => e.isNotEmpty)
+                  .toList();
+              await Hive.box('settings_box').put('allowed_study_keywords', parsed);
+              setState(() => _customStudyKeywords = parsed);
+              if (ctx.mounted) Navigator.pop(ctx);
+            },
+            child: const Text('Save Whitelist'),
+          ),
+        ],
+      ),
+    );
+  }
 
   String _formatAudioDuration(Duration d) {
     if (d.inSeconds <= 0 || d.inHours >= 24) return '00:00';
@@ -328,10 +689,18 @@ while ($true) {
       }
 
       if (isWindowsNative) {
-        await _ensureWindowsAudioBridge();
-        final formattedUri = isLocal ? Uri.file(targetUri).toString() : targetUri;
-        _winAudioProcess!.stdin.writeln('VOL|$_volume');
-        _winAudioProcess!.stdin.writeln('OPEN|$formattedUri');
+        final player = _ensureWindowsPlayer();
+        await player.setVolume(_volume * 100.0);
+        final media = isLocal
+            ? mk.Media(targetUri)
+            : mk.Media(
+                targetUri,
+                httpHeaders: const {
+                  'User-Agent':
+                      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                },
+              );
+        await player.open(media, play: true);
       } else {
         final player = _ensureWebOrAndroidPlayer();
         await player.setVolume(_volume);
@@ -366,7 +735,7 @@ while ($true) {
     try {
       if (_isMusicPlaying) {
         if (isWindowsNative) {
-          _winAudioProcess?.stdin.writeln('PAUSE|');
+          await _winPlayer?.pause();
         } else {
           await _mobileWebPlayer?.pause();
         }
@@ -374,7 +743,7 @@ while ($true) {
       } else {
         if (_audioPosition.inSeconds >= 1 && !_isLiveRadioStream) {
           if (isWindowsNative) {
-            _winAudioProcess?.stdin.writeln('RESUME|');
+            await _winPlayer?.play();
           } else {
             await _mobileWebPlayer?.resume();
           }
@@ -391,7 +760,7 @@ while ($true) {
   Future _stopMusic() async {
     try {
       if (isWindowsNative) {
-        _winAudioProcess?.stdin.writeln('STOP|');
+        await _winPlayer?.stop();
       } else {
         await _mobileWebPlayer?.stop();
       }
@@ -433,7 +802,7 @@ while ($true) {
     if (targetSecs >= maxSecs - 1) targetSecs = maxSecs - 1;
     setState(() => _audioPosition = Duration(seconds: targetSecs));
     if (isWindowsNative) {
-      _winAudioProcess?.stdin.writeln('SEEK|$targetSecs');
+      await _winPlayer?.seek(Duration(seconds: targetSecs));
     } else {
       await _mobileWebPlayer?.seek(Duration(seconds: targetSecs));
     }
@@ -458,15 +827,19 @@ while ($true) {
     if (!isDesktopPlatform) return;
     if (!_isMiniHud) {
       setState(() => _isMiniHud = true);
+      await windowManager.setOpacity(0.95);
       await windowManager.setAlwaysOnTop(true);
-      await windowManager.setMinimumSize(const Size(330, 195));
-      await windowManager.setSize(const Size(330, 195));
+      await windowManager.setMinimumSize(const Size(336, 198));
+      await windowManager.setSize(const Size(336, 198));
+      _Win32WindowHelper.applyWindows11Style(isHud: true);
     } else {
       setState(() => _isMiniHud = false);
+      await windowManager.setOpacity(1.0);
       await windowManager.setAlwaysOnTop(false);
       await windowManager.setMinimumSize(const Size(600, 650));
       await windowManager.setSize(const Size(1180, 840));
       await windowManager.center();
+      _Win32WindowHelper.applyWindows11Style(isHud: false);
     }
   }
 
@@ -485,7 +858,13 @@ while ($true) {
     HapticFeedback.mediumImpact();
     if (_isRunning) {
       _timer?.cancel();
-      setState(() => _isRunning = false);
+      _graceTimer?.cancel();
+      setState(() {
+        _isRunning = false;
+        _graceSecondsLeft = 0;
+        _isStudySiteAllowed = false;
+        _pendingShieldAlert = false;
+      });
     } else {
       setState(() => _isRunning = true);
       _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
@@ -907,8 +1286,14 @@ while ($true) {
 
   void _completeSession() {
     _timer?.cancel();
+    _graceTimer?.cancel();
     HapticFeedback.heavyImpact();
-    setState(() => _isRunning = false);
+    setState(() {
+      _isRunning = false;
+      _graceSecondsLeft = 0;
+      _isStudySiteAllowed = false;
+      _pendingShieldAlert = false;
+    });
     if (_isMiniHud) _toggleMiniHud();
 
     if (_isBreakMode) {
@@ -1000,8 +1385,11 @@ while ($true) {
   @override
   void dispose() {
     _timer?.cancel();
-    _winStdoutSub?.cancel();
-    _winAudioProcess?.kill(ProcessSignal.sigterm);
+    _graceTimer?.cancel();
+    if (isDesktopPlatform) {
+      windowManager.removeListener(this);
+    }
+    _winPlayer?.dispose();
     _mobileWebPlayer?.dispose();
     _doubtCtrl.dispose();
     _chatScrollCtrl.dispose();
@@ -1193,105 +1581,327 @@ while ($true) {
     );
   }
 
+  Widget _buildFluentHudIconButton({
+    required IconData icon,
+    required VoidCallback onTap,
+    Color color = Colors.white70,
+    String? tooltip,
+  }) {
+    final btn = Material(
+      color: Colors.white.withValues(alpha: 0.06),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(6),
+        side: BorderSide(color: Colors.white.withValues(alpha: 0.08), width: 0.8),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        hoverColor: Colors.white.withValues(alpha: 0.10),
+        highlightColor: Colors.white.withValues(alpha: 0.14),
+        splashColor: Colors.white.withValues(alpha: 0.16),
+        child: SizedBox(
+          width: 28,
+          height: 28,
+          child: Center(
+            child: Icon(icon, size: 15, color: color),
+          ),
+        ),
+      ),
+    );
+    return tooltip != null ? Tooltip(message: tooltip, child: btn) : btn;
+  }
+
   Widget _buildMiniHudScaffold() {
     final accentColor = _isBreakMode ? Colors.amberAccent : Colors.tealAccent;
+    final bool isSpillWarning =
+        !_isStudySiteAllowed && _pendingShieldAlert && _graceSecondsLeft > 0;
+
+    final Color statusColor = _isStudySiteAllowed
+        ? Colors.greenAccent
+        : (isSpillWarning
+            ? Colors.redAccent
+            : (_graceSecondsLeft > 0 ? Colors.deepOrangeAccent : accentColor));
+
+    final String shieldLabel = _isStudySiteAllowed
+        ? 'STUDY OK'
+        : (isSpillWarning
+            ? 'SPILL • ${_graceSecondsLeft}s'
+            : (_graceSecondsLeft > 0 ? '${_graceSecondsLeft}s' : 'SHIELD'));
+
+    final Color badgeBg = _isStudySiteAllowed
+        ? Colors.green.withValues(alpha: 0.28)
+        : (isSpillWarning
+            ? Colors.redAccent.withValues(alpha: 0.30)
+            : (_graceSecondsLeft > 0
+                ? Colors.deepOrange.withValues(alpha: 0.32)
+                : Colors.white.withValues(alpha: 0.07)));
+
+    final Color badgeFg = _isStudySiteAllowed
+        ? Colors.greenAccent
+        : (isSpillWarning
+            ? Colors.redAccent
+            : (_graceSecondsLeft > 0 ? Colors.orangeAccent : Colors.tealAccent));
+
+    final int totalSecs = _initialMinutes * 60;
+    final double progress = totalSecs > 0
+        ? ((totalSecs - _secondsRemaining) / totalSecs).clamp(0.0, 1.0)
+        : 0.0;
+
+    final String timeStr = _formatTime(_secondsRemaining);
+
     return Scaffold(
-      backgroundColor: const Color(0xFF101417),
+      backgroundColor: const Color(0xFF1A1D21),
       body: GestureDetector(
         onPanStart: (_) => windowManager.startDragging(),
         child: Container(
-          decoration: BoxDecoration(
-            border: Border.all(color: accentColor.withValues(alpha: 0.5), width: 1.5),
+          decoration: const BoxDecoration(
+            color: Color(0xFF1A1D21),
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [
+                Color(0xFF21252B),
+                Color(0xFF171A1F),
+              ],
+            ),
           ),
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Row(
-                    children: [
-                      Icon(Icons.push_pin, size: 14, color: accentColor),
-                      const SizedBox(width: 6),
-                      Text(
-                        _isBreakMode ? 'RECOVERY BREAK' : _selectedSubject,
-                        style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: accentColor),
-                      ),
-                    ],
-                  ),
-                  Row(
-                    children: [
-                      IconButton(
-                        visualDensity: VisualDensity.compact,
-                        padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints(),
-                        icon: const Icon(Icons.skip_previous_rounded, size: 16, color: Colors.white54),
-                        onPressed: () => _skipTrack(-1),
-                      ),
-                      const SizedBox(width: 6),
-                      IconButton(
-                        visualDensity: VisualDensity.compact,
-                        padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints(),
-                        icon: Icon(
-                          _isMusicPlaying ? Icons.music_note : Icons.music_off_outlined,
-                          size: 16,
-                          color: _isMusicPlaying ? Colors.tealAccent : Colors.white54,
-                        ),
-                        onPressed: _toggleDirectMusic,
-                      ),
-                      const SizedBox(width: 6),
-                      IconButton(
-                        visualDensity: VisualDensity.compact,
-                        padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints(),
-                        icon: const Icon(Icons.skip_next_rounded, size: 16, color: Colors.white54),
-                        onPressed: () => _skipTrack(1),
-                      ),
-                      const SizedBox(width: 10),
-                      IconButton(
-                        visualDensity: VisualDensity.compact,
-                        padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints(),
-                        icon: const Icon(Icons.open_in_full, size: 16),
-                        onPressed: _toggleMiniHud,
-                      ),
-                    ],
-                  ),
-                ],
+              // Subtle 2px Windows 11 top status strip
+              AnimatedContainer(
+                duration: const Duration(milliseconds: 250),
+                height: 2,
+                width: double.infinity,
+                color: (_isStudySiteAllowed || _graceSecondsLeft > 0)
+                    ? statusColor.withValues(alpha: 0.9)
+                    : Colors.white.withValues(alpha: 0.06),
               ),
-              Text(
-                _formatTime(_secondsRemaining),
-                style: TextStyle(
-                  fontSize: 42,
-                  fontWeight: FontWeight.bold,
-                  color: _isBreakMode ? Colors.amberAccent : Colors.white,
-                  fontFeatures: const [FontFeature.tabularFigures()],
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Flexible(
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Container(
+                            width: 7,
+                            height: 7,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: _isRunning ? statusColor : Colors.white38,
+                            ),
+                          ),
+                          const SizedBox(width: 7),
+                          Flexible(
+                            child: Text(
+                              _isBreakMode ? 'Recovery' : _selectedSubject,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.w600,
+                                color: Colors.white,
+                              ),
+                            ),
+                          ),
+                          if (_isStrictMode && !_isBreakMode) ...[
+                            const SizedBox(width: 7),
+                            AnimatedSwitcher(
+                              duration: const Duration(milliseconds: 180),
+                              transitionBuilder: (child, anim) {
+                                return AnimatedBuilder(
+                                  animation: anim,
+                                  builder: (context, inner) {
+                                    final blur = (1.0 - anim.value) * 1.8;
+                                    return ImageFiltered(
+                                      imageFilter: ImageFilter.blur(
+                                        sigmaX: blur,
+                                        sigmaY: blur * 0.5,
+                                      ),
+                                      child: FadeTransition(
+                                        opacity: anim,
+                                        child: inner,
+                                      ),
+                                    );
+                                  },
+                                  child: child,
+                                );
+                              },
+                              child: Container(
+                                key: ValueKey(shieldLabel),
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 6, vertical: 2),
+                                decoration: BoxDecoration(
+                                  color: badgeBg,
+                                  borderRadius: BorderRadius.circular(5),
+                                  border: Border.all(
+                                    color: badgeFg.withValues(alpha: 0.35),
+                                    width: 0.7,
+                                  ),
+                                ),
+                                child: Text(
+                                  shieldLabel,
+                                  style: TextStyle(
+                                    fontSize: 9.5,
+                                    fontWeight: FontWeight.w700,
+                                    color: badgeFg,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        _buildFluentHudIconButton(
+                          icon: Icons.skip_previous,
+                          tooltip: 'Previous Track',
+                          onTap: () => _skipTrack(-1),
+                        ),
+                        const SizedBox(width: 4),
+                        _buildFluentHudIconButton(
+                          icon: _isMusicPlaying
+                              ? Icons.music_note
+                              : Icons.music_off_outlined,
+                          color: _isMusicPlaying
+                              ? Colors.tealAccent
+                              : Colors.white60,
+                          tooltip: _isMusicPlaying ? 'Pause Music' : 'Play Music',
+                          onTap: _toggleDirectMusic,
+                        ),
+                        const SizedBox(width: 4),
+                        _buildFluentHudIconButton(
+                          icon: Icons.skip_next,
+                          tooltip: 'Next Track',
+                          onTap: () => _skipTrack(1),
+                        ),
+                        const SizedBox(width: 6),
+                        _buildFluentHudIconButton(
+                          icon: Icons.open_in_full,
+                          color: Colors.white,
+                          tooltip: 'Expand Dashboard',
+                          onTap: _toggleMiniHud,
+                        ),
+                      ],
+                    ),
+                  ],
                 ),
               ),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                children: [
-                  FilledButton.tonalIcon(
-                    style: FilledButton.styleFrom(visualDensity: VisualDensity.compact),
-                    onPressed: _toggleTimer,
-                    icon: Icon(_isRunning ? Icons.pause : Icons.play_arrow, size: 16),
-                    label: Text(_isRunning ? 'Pause' : 'Start'),
+              // Crisp Timer with Subtle Vertical Motion Blur on Tick
+              AnimatedSwitcher(
+                duration: const Duration(milliseconds: 190),
+                transitionBuilder: (child, anim) {
+                  return AnimatedBuilder(
+                    animation: anim,
+                    builder: (context, inner) {
+                      final blur = (1.0 - anim.value) * 1.8;
+                      return ImageFiltered(
+                        imageFilter: ImageFilter.blur(
+                          sigmaX: 0.2,
+                          sigmaY: blur,
+                        ),
+                        child: FadeTransition(
+                          opacity: anim,
+                          child: SlideTransition(
+                            position: Tween(
+                              begin: const Offset(0, 0.08),
+                              end: Offset.zero,
+                            ).animate(CurvedAnimation(
+                              parent: anim,
+                              curve: Curves.easeOutCubic,
+                            )),
+                            child: inner,
+                          ),
+                        ),
+                      );
+                    },
+                    child: child,
+                  );
+                },
+                child: Text(
+                  timeStr,
+                  key: ValueKey(timeStr),
+                  style: TextStyle(
+                    fontSize: 44,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 1.0,
+                    color: _isBreakMode ? Colors.amberAccent : Colors.white,
+                    fontFeatures: const [FontFeature.tabularFigures()],
                   ),
-                  if (!_isBreakMode)
-                    OutlinedButton.icon(
-                      style: OutlinedButton.styleFrom(visualDensity: VisualDensity.compact),
-                      onPressed: _incrementSpill,
-                      icon: const Icon(Icons.warning_amber_rounded, size: 15, color: Colors.orangeAccent),
-                      label: Text('Spill ($_currentSpills)'),
+                ),
+              ),
+              // Windows 11 Native Control Bar
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: FilledButton.tonalIcon(
+                        style: FilledButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          backgroundColor: accentColor.withValues(alpha: 0.16),
+                          foregroundColor: accentColor,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                        ),
+                        onPressed: _toggleTimer,
+                        icon: Icon(
+                          _isRunning ? Icons.pause : Icons.play_arrow,
+                          size: 16,
+                        ),
+                        label: Text(
+                          _isRunning ? 'Pause' : 'Start',
+                          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                        ),
+                      ),
                     ),
-                  IconButton(
-                    visualDensity: VisualDensity.compact,
-                    icon: const Icon(Icons.check_circle_outline, color: Colors.tealAccent),
-                    onPressed: _completeSession,
-                  ),
-                ],
+                    if (!_isBreakMode) ...[
+                      const SizedBox(width: 8),
+                      OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          backgroundColor: Colors.white.withValues(alpha: 0.04),
+                          side: BorderSide(
+                            color: Colors.white.withValues(alpha: 0.12),
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                        ),
+                        onPressed: _incrementSpill,
+                        icon: const Icon(
+                          Icons.warning_amber_rounded,
+                          size: 14,
+                          color: Colors.orangeAccent,
+                        ),
+                        label: Text(
+                          'Spill ($_currentSpills)',
+                          style: const TextStyle(fontSize: 11.5, color: Colors.white),
+                        ),
+                      ),
+                    ],
+                    const SizedBox(width: 8),
+                    _buildFluentHudIconButton(
+                      icon: Icons.check_circle_outline,
+                      color: Colors.tealAccent,
+                      tooltip: 'Finish & Log Block',
+                      onTap: _completeSession,
+                    ),
+                  ],
+                ),
+              ),
+              // Edge-to-Edge Bottom Progress Track
+              LinearProgressIndicator(
+                value: progress,
+                minHeight: 3,
+                backgroundColor: Colors.white.withValues(alpha: 0.06),
+                valueColor: AlwaysStoppedAnimation(statusColor),
               ),
             ],
           ),
@@ -1408,6 +2018,46 @@ while ($true) {
           }).toList(),
         ),
         const SizedBox(height: 10),
+        if (!_isBreakMode && isDesktopPlatform)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8.0),
+            child: Wrap(
+              alignment: WrapAlignment.center,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 4,
+              children: [
+                FilterChip(
+                  avatar: Icon(
+                    _isStrictMode ? Icons.shield : Icons.shield_outlined,
+                    size: 17,
+                    color: _isStrictMode ? Colors.tealAccent : Colors.white60,
+                  ),
+                  label: Text(
+                    _isStrictMode
+                        ? 'Strict Focus Shield: ON (30s Grace)'
+                        : 'Strict Focus Shield: OFF',
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                  selected: _isStrictMode,
+                  onSelected: (val) {
+                    setState(() => _isStrictMode = val);
+                    if (!val) {
+                      _graceTimer?.cancel();
+                      _graceSecondsLeft = 0;
+                      _isStudySiteAllowed = false;
+                      _pendingShieldAlert = false;
+                    }
+                  },
+                ),
+                IconButton(
+                  tooltip: 'Allowed Study Sites & YouTube Filter',
+                  visualDensity: VisualDensity.compact,
+                  icon: const Icon(Icons.tune, size: 18, color: Colors.tealAccent),
+                  onPressed: _showWhitelistDialog,
+                ),
+              ],
+            ),
+          ),
         if (!_isBreakMode)
           Padding(
             padding: const EdgeInsets.only(bottom: 10.0),
@@ -1581,7 +2231,7 @@ while ($true) {
                             onChanged: (val) {
                               setState(() => _volume = val);
                               if (isWindowsNative) {
-                                _winAudioProcess?.stdin.writeln('VOL|$val');
+                                _winPlayer?.setVolume(val * 100.0);
                               } else {
                                 _mobileWebPlayer?.setVolume(val);
                               }
@@ -1612,7 +2262,7 @@ while ($true) {
                               ? (sec) async {
                                   final target = sec.toInt();
                                   if (isWindowsNative) {
-                                    _winAudioProcess?.stdin.writeln('SEEK|$target');
+                                    await _winPlayer?.seek(Duration(seconds: target));
                                   } else {
                                     await _mobileWebPlayer?.seek(Duration(seconds: target));
                                   }
@@ -2158,6 +2808,12 @@ class LogBottomSheet extends ConsumerStatefulWidget {
 class _LogBottomSheetState extends ConsumerState {
   double _fatigue = 3;
   final TextEditingController _breadcrumbCtrl = TextEditingController();
+
+  @override
+  void dispose() {
+    _breadcrumbCtrl.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
