@@ -4,12 +4,14 @@
 
 **A cross-platform cognitive workstation designed to replace passive, single-subject marathon grinding with dynamic subject interleaving, working-memory spill tracking, and AI-guided active recall.**
 
-[![Flutter](https://img.shields.io/badge/Flutter-Cross--Platform-02569B?logo=flutter&logoColor=white)](https://flutter.dev)
-[![State Management](https://img.shields.io/badge/Riverpod-State_Management-00B4AB?logo=dart&logoColor=white)](https://riverpod.dev)
-[![Local Storage](https://img.shields.io/badge/Hive-Local_NoSQL-FFCA28?logo=firebase&logoColor=black)](https://docs.hivedb.dev/)
-[![Cloud Backend](https://img.shields.io/badge/Cloudflare_Workers-Edge_KV_&_AI_Proxy-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
-[![AI Engine](https://img.shields.io/badge/Groq-LPU_Inference-F55036)](https://groq.com/)
-[![CI Build](https://github.com/naman2365/NeuroFlow/actions/workflows/build.yml/badge.svg)](https://github.com/naman2365/NeuroFlow/actions/workflows/build.yml)
+![Flutter](https://img.shields.io/badge/Flutter-Cross--Platform-02569B?logo=flutter&logoColor=white)
+![Riverpod](https://img.shields.io/badge/Riverpod-State%20Management-00BFA5)
+![Hive](https://img.shields.io/badge/Hive-Local%20NoSQL-FBC02D?logo=hive&logoColor=black)
+![Cloudflare Workers](https://img.shields.io/badge/Cloudflare%20Workers-Edge%20KV%20%26%20AI%20Proxy-F38020?logo=cloudflareworkers&logoColor=white)
+![Groq](https://img.shields.io/badge/Groq-LPU%20Inference-E53935)
+![Release](https://img.shields.io/badge/Release-v1.2.0%20Windows%20%7C%20v1.1.0%20Android-00BFA5)
+[![NeuroFlow CI & Release Builder](https://github.com/naman2365/NeuroFlow/actions/workflows/build.yml/badge.svg)](https://github.com/naman2365/NeuroFlow/actions/workflows/build.yml)
+
 </div>
 
 ---
@@ -26,50 +28,69 @@ Traditional Pomodoro timers treat every hour of study as identical. **NeuroFlow*
 
 ## ✨ Key Features
 
-* 🤖 **Groq-Powered Subject Mentor & Study Planner:**
-  * Context-aware AI tutor that adapts to your active subject chip, student profile, recent fatigue scores, and latest 5-word breadcrumbs.
-  * **One-Click Smart Actions:** *Plan Next 3 Blocks*, *Quiz Me on Selected Subject*, and *Resume My Breadcrumb*.
-  * **Clean Unicode Math Engine:** Automatically converts raw LaTeX expressions into clean, readable mathematical notation (`½ mv² = mgR(1 − cos θ)`).
-* 🔒 **First-Claim PIN-Protected Cloud Sync:**
-  * Built on **Cloudflare Workers + KV Storage** for instant, zero-config cross-device sync between Windows PC and Android.
-  * Users claim any username/Sync ID with a secret PIN on first sync; subsequent requests verify the PIN at the edge so logs stay private and isolated.
-* 📌 **Always-On-Top Desktop Mini HUD:**
-  * Collapses the full 1180×840 workstation into a frameless, pinned `330×195` floating HUD so you can keep your timer, memory-spill counter, and focus audio controls visible over PDFs, lecture videos, or IDEs.
-* 🎧 **3-in-1 Focus Audio Hub:**
-  * **Built-in Streamer:** Instant playback for *Lofi Focus Beats*, *Deep Ambient Drone*, *Synthwave Coding*, and *Classical Study*.
-  * **Local Audio Loop:** Pick and loop any offline `.mp3`, `.wav`, or `.flac` track from your device.
-  * **External Shortcuts:** Customizable 1-click launchers for your favorite Spotify and YouTube Music playlists.
-* 📊 **Real-Time Cognitive Analytics:**
-  * **14-Day Consistency Heatmap** tracking daily focus intensity.
-  * **Subject Balance Distribution** bars to prevent neglecting weaker subjects.
-  * **7-Block Fatigue Trend Bar Chart** powered by `fl_chart`.
-* 💬 **Built-In Guide & Creator Feedback Inbox:**
-  * Users can send bug reports and feature ideas straight to the cloud KV inbox, protected by a server-side Creator PIN.
+- 🤖 **Groq-Powered Subject Mentor & Study Planner:**
+  - Context-aware AI tutor that adapts to your active subject chip, student profile, recent fatigue scores, and latest 5-word breadcrumbs.
+  - **One-Click Smart Actions:** *Plan Next 3 Blocks*, *Quiz Me on Selected Subject*, and *Resume My Breadcrumb*.
+  - **Clean Unicode Math Engine:** Automatically converts raw LaTeX expressions into clean, readable mathematical notation (`θ`, `π`, `Δ`, `√`, `½`, `x²`, `→`).
+- 🛡️ **Strict Focus Shield & Smart Study Whitelist *(New in v1.2.0 — Windows)*:**
+  - **Continuous 30-Second Grace Buffer:** Tracks active focus throughout your study block—including when pinned in the Mini-HUD so the shield cannot be bypassed. Leaving to a distraction for over 30s plays a Windows alert chime, logs `+1 Memory Spill`, and keeps ticking live in a red `SPILL • 30s` warning state.
+  - **Native Win32 Window-Title Inspection (`dart:ffi`):** Reads active window titles via `user32.dll` with zero browser extensions. Automatically pauses the shield (`STUDY OK`) on study platforms (Physics Wallah, Khan Academy, NCERT, VS Code, GitHub, Notion, PDFs) and subject-relevant YouTube lectures while catching YouTube Shorts, gaming, and social media.
+  - **Custom Keyword Whitelist:** Add your own allowed study platforms or apps in-app, persisted locally in Hive.
+- 🪟 **Windows 11 Fluent Mini-HUD *(Upgraded in v1.2.0)*:**
+  - Always-on-top compact companion featuring native Windows 11 rounded corners and Acrylic/Mica backdrop via `dwmapi.dll` FFI.
+  - Includes a live shield badge (`STUDY OK` / `30s` / `SPILL • 30s`), edge-to-edge session progress bar, quick music controls, and subtle vertical motion-blur timer transitions.
+- 🎵 **Audio Hub 2.0 & Native `libmpv` Engine *(v1.1.0 + v1.2.0)*:**
+  - Powered by native **`media_kit` (`libmpv` FFI)** on Windows for rock-solid local audio playlists (`.mp3`, `.wav`, `.m4a`, `.flac`, `.ogg`, `.aac`), track scrubbing, 10s skip, loop-one/auto-next, and volume control.
+  - Customizable one-tap external shortcuts for **Spotify** and **YouTube Music**.
+- ☁️ **PIN-Protected Cloud Sync & Creator Inbox *(v1.1.0)*:**
+  - Mirror study logs across Windows and Android using a unique Username + Secret PIN backed by Cloudflare Workers Edge KV.
+  - Built-in **Help & Feedback** hub with direct cloud submission and a PIN-protected Creator Inbox.
+- 📊 **Cognitive Analytics Dashboard:**
+  - Real-time KPI cards (**Total Focus**, **Avg Strain**, **Total Spills**), **14-Day Consistency Heatmap**, **Subject Balance** breakdown, and a **7-Block Fatigue Trend** chart.
 
 ---
 
-## 🏗️ Tech Stack & Architecture
+## 🚀 Release Highlights
 
-| Layer | Technology | Purpose |
-| :--- | :--- | :--- |
-| **Frontend UI** | Flutter (Material 3 Dark) | Responsive split-pane desktop workstation & mobile layout |
-| **State Management** | `flutter_riverpod` | Reactive timer state, auto-regulated duration providers, and AI chat state |
-| **Local Persistence** | `hive_flutter` | Offline-first NoSQL storage for study logs, custom subjects, and settings |
-| **Edge Backend** | Cloudflare Workers | Serverless API proxy keeping `GROQ_API_KEY` and `CREATOR_PIN` 100% off-client |
-| **Cloud Database** | Cloudflare KV (`SYNC_KV`) | Low-latency key-value storage for PIN-locked user logs and feedback inbox |
-| **Desktop Windowing** | `window_manager` | Custom title bar, drag regions, and Always-On-Top Mini HUD mode |
+### `v1.2.0` — Windows Desktop Edition *(Latest)*
+> Distributed via **Inno Setup** (`NeuroFlow-Setup-v1.2.0.exe`). Android users should continue using **`v1.1.0`** ahead of the ground-up Android UI overhaul in **`v2.0.0`**.
+- Added **Strict Focus Shield** with a 30s grace buffer, continuous Mini-HUD tracking, and native `user32.dll` study-site & YouTube lecture whitelisting.
+- Redesigned the **Mini-HUD** with native Windows 11 DWM rounded corners, Fluent controls, edge progress bar, and subtle motion-blur timer transitions.
+- Migrated Windows audio playback to native **`media_kit` (`libmpv`)** for reliable local playlists and seeking.
+- Fixed the `flutter_windows.dll` accessibility crash via `ExcludeSemantics` and resolved Riverpod initialization assertions.
+
+### `v1.1.0` — Audio Hub 2.0, Groq Mentor & Android Release
+- Launched **Audio Hub 2.0** with local playlist queueing, transport controls, and Spotify/YT Music shortcuts.
+- Added **Groq AI Subject Mentor** with Unicode math formatting and breadcrumb-aware study planning.
+- Introduced **PIN-Protected Cloudflare Cloud Sync**, in-app feedback submission, and the **Android APK** build.
 
 ---
 
-## 🚀 Getting Started (Run from Source)
+## 📦 Download & Installation
 
-### Prerequisites
-* [Flutter SDK](https://docs.flutter.dev/get-started/install) (3.x or higher)
-* Visual Studio 2022 with *"Desktop development with C++"* (for Windows builds) or Android Studio (for Android APK builds)
+- **Windows (`v1.2.0`):** Download and run **`NeuroFlow-Setup-v1.2.0.exe`** from the [Releases](https://github.com/naman2365/NeuroFlow/releases) page.
+- **Android (`v1.1.0`):** Download the **`v1.1.0`** `.apk` from [Releases](https://github.com/naman2365/NeuroFlow/releases) and connect using your Cloud Sync Username + PIN.
 
-### Installation
+---
 
-1. **Clone the repository:**
-   ```bash
-   git clone [https://github.com/naman2365/NeuroFlow.git](https://github.com/naman2365/NeuroFlow.git)
-   cd NeuroFlow
+## 🛠️ Build from Source
+
+```bash
+git clone [https://github.com/naman2365/NeuroFlow.git](https://github.com/naman2365/NeuroFlow.git)
+cd NeuroFlow
+flutter pub get
+
+# Run on Windows
+flutter run -d windows
+
+# Build Windows Release (for Inno Setup)
+flutter build windows --release
+```
+
+---
+
+## 🗺️ Roadmap (`v2.0.0`)
+
+- **Windows & Android UI Overhaul:** Ground-up visual redesign across both desktop and mobile for a cleaner, more cohesive workstation experience.
+- **Android Native Focus Shield:** Background app and study-content detection via `UsageStatsManager` and `AccessibilityService`.
+- **macOS & Linux Desktop Support:** Native builds expanding NeuroFlow to macOS and Linux alongside Windows.
