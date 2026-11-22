@@ -91,6 +91,6 @@ flutter build windows --release
 
 ## 🗺️ Roadmap (`v2.0.0`)
 
-- **Android Major UI Overhaul:** Redesigned mobile-first layout built for one-handed study sessions.
+- **Windows & Android UI Overhaul:** Ground-up visual redesign across both desktop and mobile for a cleaner, more cohesive workstation experience.
 - **Android Native Focus Shield:** Background app and study-content detection via `UsageStatsManager` and `AccessibilityService`.
-- **Linux Desktop Support:** Native Linux build with `media_kit_libs_linux` and desktop window tracking.
+- **macOS & Linux Desktop Support:** Native builds expanding NeuroFlow to macOS and Linux alongside Windows.
